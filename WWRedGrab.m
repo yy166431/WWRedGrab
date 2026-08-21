@@ -7,6 +7,7 @@
 #import <sys/mman.h>
 #import <pthread.h>
 #import <QuartzCore/QuartzCore.h>
+#import <libkern/OSCacheControl.h>
 #import <string.h>
 #import <stdlib.h>
 
