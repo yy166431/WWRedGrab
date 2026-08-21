@@ -1,38 +1,49 @@
 # WWRedGrab
 
-企业微信秒抢红包 dylib（协议直拆 / 巨魔 TrollFools）
+企业微信 **协议层** 秒抢红包 dylib（巨魔 / TrollFools）
 
 ## 目标
 
-- `com.tencent.ww` 企业微信 5.0.10+
+- `com.tencent.ww` 5.0.10（build 229043）实测 dump
 - iOS 15+ arm64
 
-## 原理（跟安卓拼手速）
+## 和 UI 版的区别
 
-不走点开 UI，走官方同一条网络链：
+| | UI 点开 | 本版 |
+|--|--|--|
+| 路径 | 气泡 → 开包窗 → 点开 | **SendGrabHongBao + SendUnWrapHongBao** |
+| 弹窗 | 有 | **无** |
+| 函数 | ObjC | 二进制 `redenvelopes_protocol_backend.cpp` |
 
-1. `OnAddMessage` 发现红包消息  
-2. `tony_onClickHongbaoMessage` → 内部 **SendGrabHongBao**  
-3. 截获 `openHongBaoWindow:...openBlock:` → **直接回调 openBlock**  
-   - openBlock 内部就是 **SendUnWrapHongBao**（协议拆包）  
-   - **不创建开包窗 / 详情页**  
-4. 金额：`mSelfRecvAmount` / `didOpenRedEvnSuc` / header amount / RecvInfo 通知
+### 协议偏移（unslid，基址 `0x100000000`）
 
-延迟建议 **0ms**。白名单 = 会话名包含则**不抢**。
+```
+SendGrabHongBao   @ 0x100bca7bc   file+0xbca7bc
+SendUnWrapHongBao @ 0x100bcad00   file+0xbcad00
+```
 
-## 功能
+启动后 inline hook 这两个函数，偷 `protocol this`。  
+之后新红包：**直接调 orig Grab → UnWrap**，不创建任何红包 UI。
 
-- 协议直拆（无弹窗）
-- 悬浮球：开关 / 延迟 / 白名单 / 累计金额 / 记录
-- 中文面板
+首次若 `this` 未捕获，会短暂走 `tony_onClick` 组装参数（仍拦截开窗），一旦系统自己发过 Grab，后续全协议。
 
-## 构建
+## 面板
 
-GitHub Actions → artifact `WWRedGrab-dylib`  
-或 macOS: `make`
+- 自动抢 / 延迟（建议 **0**）
+- 白名单 = 会话名包含则**不抢**
+- 累计金额 / 记录
+- 协议状态：绿=`this` 已就绪
 
-## 注入
+悬浮球：红=未捕获 this，**绿+P**=协议直调就绪
 
-TrollFools → 企业微信 → 注入 `WWRedGrab.dylib` → 强杀重开
+## 构建 / 注入
 
-日志：`[WWRedGrab]`
+Actions → `WWRedGrab-dylib`  
+TrollFools → 企业微信 → 注入 → **强杀重开**
+
+日志：`[WWRedGrab]`  
+关键：`捕获 protocol this` / `协议直调 SendGrab` / `协议直调 SendUnWrap` / `入账`
+
+## 升级
+
+换版本后重新 dump 上述两个偏移再改 `kOff_SendGrab` / `kOff_SendUnWrap`。
