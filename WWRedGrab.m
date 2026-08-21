@@ -4,19 +4,17 @@
 #import <objc/message.h>
 
 /*
- * WWRedGrab v5
+ * WWRedGrab v6 — crash fix on receive
  *
- * Manual open crash was from block-swizzling openHongBaoWindow (C++ ABI).
- * v5: NEVER touch openHongBaoWindow / window UI methods.
+ * v5 crash on HB appear: OnAddMessage C hook likely broke scoped_refptr ABI,
+ * or FireGrab re-entered parse/updateData on receive path.
  *
- * Detection:
- *  1) -[WWKMessage p_parseHongBaoMessage:]  (best: self is ready WWKMessage)
- *  2) -[WWKMessage p_parseLishiHongBaoMessage:]
- *  3) OnAddMessage end==YES as backup (C IMP, not block)
- *
- * Auto grab:
- *  delay -> fake bubble tony_onClick (Grab)
- *  poll currentActiveHongbaoWindow -> onOpenBtnClick (UnWrap)
+ * v6:
+ *  - NO OnAddMessage hook at all
+ *  - ONLY p_parseHongBaoMessage / p_parseLishiHongBaoMessage
+ *  - after original: dispatch_async + delay, never re-parse
+ *  - FireGrab: no parseMessage, no updateData
+ *  - still NO openHongBaoWindow hooks
  */
 
 static NSString * const kEn  = @"wwrg_enabled";
@@ -56,7 +54,7 @@ static BOOL On(void) {
 }
 static NSInteger DelayMs(void) {
     NSInteger v = [UD() integerForKey:kDly];
-    if (v < 150) v = 150;
+    if (v < 200) v = 200;
     if (v > 3000) v = 3000;
     return v;
 }
@@ -139,14 +137,12 @@ static void Book(NSString *conv, NSString *hid, long long fen, NSString *wish) {
     dispatch_async(dispatch_get_main_queue(), ^{ RefreshBall(); });
 }
 
-/* C IMP swap — safe for pointer/BOOL args. Do NOT use for C++ by-value types. */
 static void Exchange(Class c, SEL sel, IMP neu, IMP *outOrig) {
     if (!c) return;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) { L(@"no method %@ %s", c, sel_getName(sel)); return; }
-    IMP old = method_getImplementation(m);
+    IMP old = method_setImplementation(m, neu);
     if (outOrig) *outOrig = old;
-    method_setImplementation(m, neu);
     L(@"exchange %@ %s", c, sel_getName(sel));
 }
 
@@ -167,18 +163,18 @@ static id ActiveWin(void) {
 static void PollAndOpen(NSString *hid) {
     if (!On() || !hid.length) return;
     for (int i = 0; i < 20; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.2 + 0.15 * i) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.25 + 0.15 * i) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (gClicking) return;
             NSString *armed = nil;
             @synchronized (gLock) { armed = [gArmedHid copy]; }
             if (![armed isEqualToString:hid]) return;
             id win = ActiveWin();
             if (!win) {
-                if (i == 5 || i == 10 || i == 15) L(@"poll no win yet hid=%@ i=%d", hid, i);
+                if (i == 4 || i == 10 || i == 16) L(@"poll no win hid=%@ i=%d", hid, i);
                 return;
             }
             gClicking = YES;
-            L(@"AUTO open click hid=%@ win=%@", hid, win);
+            L(@"AUTO click open hid=%@", hid);
             if ([win isKindOfClass:UIView.class]) {
                 UIView *v = (UIView *)win;
                 v.alpha = 0.01;
@@ -191,7 +187,7 @@ static void PollAndOpen(NSString *hid) {
                 L(@"onOpenBtnClick ex %@", ex);
             }
             ClearArmIf(hid);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 id mgr = Mgr();
                 CallV(mgr, @selector(closeHongBaoWindow));
                 CallV(mgr, @selector(closeResultWindow));
@@ -221,60 +217,60 @@ static NSString *WishOf(id item) {
 
 static void FireGrab(id msg, NSString *conv) {
     if (!On() || !msg) return;
-    if (IsWL(conv)) { L(@"whitelist skip %@", conv); return; }
+    if (IsWL(conv)) return;
 
-    // ensure parsed
-    @try { if ([msg respondsToSelector:@selector(parseMessage)]) CallV(msg, @selector(parseMessage)); } @catch (__unused NSException *e) {}
-
-    id item = Call(msg, @selector(messageItem));
+    id item = nil;
+    @try { item = Call(msg, @selector(messageItem)); } @catch (__unused NSException *e) {}
     if (!IsHB(item)) {
-        NSArray *items = Call(msg, @selector(messageItems));
-        if ([items isKindOfClass:NSArray.class])
-            for (id it in items) if (IsHB(it)) { item = it; break; }
+        @try {
+            NSArray *items = Call(msg, @selector(messageItems));
+            if ([items isKindOfClass:NSArray.class])
+                for (id it in items) if (IsHB(it)) { item = it; break; }
+        } @catch (__unused NSException *e) {}
     }
     if (!IsHB(item)) {
-        L(@"no HB item on msg %@", msg);
+        L(@"no HB item");
         return;
     }
 
     NSString *hid = HidOf(item);
-    if (!hid.length) { L(@"empty hid"); return; }
+    if (!hid.length) return;
     if (!Begin(hid)) return;
 
     gLastHid = [hid copy];
     gLastConv = [conv ?: @"" copy];
     gLastWish = [WishOf(item) ?: @"" copy];
     Arm(hid);
-    L(@"FOUND hid=%@ wish=%@ conv=%@", hid, gLastWish, conv);
+    L(@"FOUND hid=%@ wish=%@", hid, gLastWish);
 
     NSInteger dly = DelayMs();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dly * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+    // hold msg strongly across delay
+    __strong id hold = msg;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dly * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         @try {
             Class bcls = NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
-            if (!bcls) { Cancel(hid); ClearArmIf(hid); L(@"no bubble class"); return; }
+            if (!bcls) { Cancel(hid); ClearArmIf(hid); return; }
             id bubble = [[bcls alloc] init];
             if ([bubble respondsToSelector:@selector(setMessage:)])
-                ((void (*)(id, SEL, id))objc_msgSend)(bubble, @selector(setMessage:), msg);
+                ((void (*)(id, SEL, id))objc_msgSend)(bubble, @selector(setMessage:), hold);
             else if ([bubble respondsToSelector:@selector(setMessage:withItemIndex:)])
-                ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(bubble, @selector(setMessage:withItemIndex:), msg, 0);
+                ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(bubble, @selector(setMessage:withItemIndex:), hold, 0);
 
-            // updateData helps fill internal state for click path
-            if ([bubble respondsToSelector:@selector(updateData)])
-                CallV(bubble, @selector(updateData));
+            // NO updateData — can crash during list churn
 
             if ([bubble respondsToSelector:@selector(tony_onClickHongbaoMessage)]) {
                 CallV(bubble, @selector(tony_onClickHongbaoMessage));
-                L(@"Grab via tony hid=%@", hid);
+                L(@"Grab tony hid=%@", hid);
             } else if ([bubble respondsToSelector:@selector(onClickHongbaoMessage)]) {
                 CallV(bubble, @selector(onClickHongbaoMessage));
-                L(@"Grab via onClick hid=%@", hid);
+                L(@"Grab click hid=%@", hid);
             } else {
                 Cancel(hid); ClearArmIf(hid); return;
             }
 
-            objc_setAssociatedObject(msg, "wwrg_b", bubble, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(hold, "wwrg_b", bubble, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                objc_setAssociatedObject(msg, "wwrg_b", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(hold, "wwrg_b", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             });
             PollAndOpen(hid);
         } @catch (NSException *ex) {
@@ -284,82 +280,42 @@ static void FireGrab(id msg, NSString *conv) {
     });
 }
 
-/* -------- C hooks (not blocks) -------- */
+/* -------- ONLY parse hooks (simple pointer arg) -------- */
 
-// p_parseHongBaoMessage:  encoding v24@0:8r^v16
 static void (*orig_parseHB)(id, SEL, const void *);
-static void hook_parseHB(id self, SEL sel, const void *m) {
-    if (orig_parseHB) orig_parseHB(self, sel, m);
-    else ((void (*)(id, SEL, const void *))objc_msgSend)(self, sel, m);
+static void hook_parseHB(id self, SEL _cmd, const void *m) {
+    // ALWAYS original first, full ABI
+    if (orig_parseHB) orig_parseHB(self, _cmd, m);
+
     if (!On()) return;
-    // self is WWKMessage after parse
-    L(@"p_parseHongBaoMessage self=%@", self);
-    FireGrab(self, gLastConv ?: @"");
+
+    // leave this stack completely before any grab work
+    __strong id msg = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // small extra settle
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            L(@"parseHB -> FireGrab");
+            FireGrab(msg, gLastConv ?: @"");
+        });
+    });
 }
 
 static void (*orig_parseLishi)(id, SEL, const void *);
-static void hook_parseLishi(id self, SEL sel, const void *m) {
-    if (orig_parseLishi) orig_parseLishi(self, sel, m);
-    else ((void (*)(id, SEL, const void *))objc_msgSend)(self, sel, m);
+static void hook_parseLishi(id self, SEL _cmd, const void *m) {
+    if (orig_parseLishi) orig_parseLishi(self, _cmd, m);
     if (!On()) return;
-    L(@"p_parseLishiHongBaoMessage self=%@", self);
-    FireGrab(self, gLastConv ?: @"");
-}
-
-// OnAddMessage:end:inConversation:
-// encoding v36@0:8r^v16B24{scoped_refptr}28 — last is 8-byte, pass as void* slot
-static void (*orig_addMsg)(id, SEL, const void *, BOOL, void *);
-static void hook_addMsg(id self, SEL sel, const void *vec, BOOL end, void *conv) {
-    if (orig_addMsg) orig_addMsg(self, sel, vec, end, conv);
-    if (!On() || !end || !vec) return;
-
-    // Try wrap messages while vec still valid
-    typedef struct { void **begin; void **end; void **cap; } Vec;
-    NSMutableArray *msgs = [NSMutableArray array];
-    @try {
-        const Vec *v = (const Vec *)vec;
-        if (v->begin && v->end && v->end > v->begin) {
-            ptrdiff_t n = v->end - v->begin;
-            if (n > 0 && n <= 20) {
-                for (ptrdiff_t i = 0; i < n; i++) {
-                    void *p = v->begin[i];
-                    if (!p) continue;
-                    Class mc = NSClassFromString(@"WWKMessage");
-                    if (!mc) continue;
-                    void *tmp = p;
-                    id o = [mc alloc];
-                    id msg = nil;
-                    if ([mc instancesRespondToSelector:@selector(initWithMessage:observe:)])
-                        msg = ((id (*)(id, SEL, void *, BOOL))objc_msgSend)(o, @selector(initWithMessage:observe:), &tmp, NO);
-                    else if ([mc instancesRespondToSelector:@selector(initWithMessage:)])
-                        msg = ((id (*)(id, SEL, void *))objc_msgSend)(o, @selector(initWithMessage:), &tmp);
-                    if (msg) [msgs addObject:msg];
-                }
-            }
-        }
-    } @catch (NSException *ex) {
-        L(@"addMsg wrap ex %@", ex);
-    }
-
-    NSString *convName = @"";
-    @try {
-        id n = Call(self, @selector(getName));
-        if ([n isKindOfClass:NSString.class]) convName = n;
-    } @catch (__unused NSException *e) {}
-
-    if (msgs.count) {
-        L(@"OnAddMessage end msgs=%lu conv=%@", (unsigned long)msgs.count, convName);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            for (id msg in msgs) FireGrab(msg, convName);
+    __strong id msg = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            L(@"parseLishi -> FireGrab");
+            FireGrab(msg, gLastConv ?: @"");
         });
-    }
+    });
 }
 
-// amount
 static void (*orig_setAmt)(id, SEL, unsigned long long);
-static void hook_setAmt(id self, SEL sel, unsigned long long fen) {
-    if (orig_setAmt) orig_setAmt(self, sel, fen);
-    else ((void (*)(id, SEL, unsigned long long))objc_msgSend)(self, sel, fen);
+static void hook_setAmt(id self, SEL _cmd, unsigned long long fen) {
+    if (orig_setAmt) orig_setAmt(self, _cmd, fen);
     if (!On() || fen == 0) return;
     id h = Call(self, @selector(mHongBaoID));
     NSString *hid = [h isKindOfClass:NSString.class] ? h : gLastHid;
@@ -390,7 +346,7 @@ static void hook_setAmt(id self, SEL sel, unsigned long long fen) {
     self.wl = [WL() mutableCopy] ?: [NSMutableArray array];
     CGFloat W = self.view.bounds.size.width, y = 50;
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, W - 90, 28)];
-    t.text = @"HB Grab v5"; t.textColor = UIColor.whiteColor;
+    t.text = @"HB Grab v6"; t.textColor = UIColor.whiteColor;
     t.font = [UIFont boldSystemFontOfSize:17];
     t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [self.view addSubview:t];
@@ -411,18 +367,18 @@ static void hook_setAmt(id self, SEL sel, unsigned long long fen) {
     UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 55)];
     tip.numberOfLines = 4; tip.font = [UIFont systemFontOfSize:12];
     tip.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.5 alpha:1];
-    tip.text = @"v5: no openHB hook (manual safe)\ndetect: parseHongBao + OnAddMessage\nauto: tony_onClick + poll open";
+    tip.text = @"v6: parseHB only (no OnAddMessage)\nmanual open untouched\nauto after delay via tony_onClick";
     [self.view addSubview:tip]; y += 60;
     UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 200, 24)];
-    dl.text = @"delay ms"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
+    dl.text = @"delay ms (min 200)"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
     self.dLab = [[UILabel alloc] initWithFrame:CGRectMake(W - 90, y, 74, 24)];
     self.dLab.textAlignment = NSTextAlignmentRight;
     self.dLab.textColor = UIColor.lightGrayColor;
     self.dLab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [self.view addSubview:self.dLab]; y += 26;
     self.delay = [[UISlider alloc] initWithFrame:CGRectMake(16, y, W - 32, 30)];
-    self.delay.minimumValue = 150; self.delay.maximumValue = 2000;
-    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 150) dv = 250;
+    self.delay.minimumValue = 200; self.delay.maximumValue = 2000;
+    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 200) dv = 300;
     self.delay.value = (float)dv;
     [self.delay addTarget:self action:@selector(onD:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.delay];
@@ -558,9 +514,9 @@ static void EnsureUI(void) {
         gBall.titleLabel.numberOfLines = 2;
         gBall.titleLabel.textAlignment = NSTextAlignmentCenter;
         [gBall setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        Class cls = NSClassFromString(@"WWRGBallP5");
+        Class cls = NSClassFromString(@"WWRGBallP6");
         if (!cls) {
-            cls = objc_allocateClassPair(NSObject.class, "WWRGBallP5", 0);
+            cls = objc_allocateClassPair(NSObject.class, "WWRGBallP6", 0);
             class_addMethod(cls, NSSelectorFromString(@"p:"), imp_implementationWithBlock(^(id s, UIPanGestureRecognizer *p){ Drag(p); }), "v@:@");
             class_addMethod(cls, NSSelectorFromString(@"t"), imp_implementationWithBlock(^(id s){
                 if (gPanel && !gPanel.hidden) { gPanel.hidden = YES; gPanel = nil; }
@@ -574,7 +530,7 @@ static void EnsureUI(void) {
         [key addSubview:gBall];
         RefreshBall();
         gUIReady = YES;
-        L(@"ball ready v5");
+        L(@"ball ready v6");
     });
 }
 
@@ -588,26 +544,26 @@ static void Install(void) {
     if (wmsg) {
         Exchange(wmsg, @selector(p_parseHongBaoMessage:), (IMP)hook_parseHB, (IMP *)&orig_parseHB);
         Exchange(wmsg, @selector(p_parseLishiHongBaoMessage:), (IMP)hook_parseLishi, (IMP *)&orig_parseLishi);
+    } else {
+        L(@"WWKMessage missing");
     }
 
-    Class wrap = NSClassFromString(@"WWKConversationWrapper");
-    if (wrap) {
-        Exchange(wrap, @selector(OnAddMessage:end:inConversation:), (IMP)hook_addMsg, (IMP *)&orig_addMsg);
-    }
+    // NO OnAddMessage — C++ scoped_refptr ABI crash risk
+    // NO openHongBaoWindow
 
     Class detail = NSClassFromString(@"WWRedEnvDetailViewController");
     if (detail) {
         Exchange(detail, @selector(setMSelfRecvAmount:), (IMP)hook_setAmt, (IMP *)&orig_setAmt);
     }
 
-    L(@"v5 installed. parseHB+OnAdd only. on=%d delay=%ld", On(), (long)DelayMs());
+    L(@"v6 installed parse-only. on=%d delay=%ld", On(), (long)DelayMs());
 }
 
 __attribute__((constructor))
 static void Init(void) {
     @autoreleasepool {
         L(@"load %@", NSBundle.mainBundle.bundleIdentifier);
-        if (![UD() objectForKey:kDly]) [UD() setInteger:250 forKey:kDly];
+        if (![UD() objectForKey:kDly]) [UD() setInteger:300 forKey:kDly];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ Install(); });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ EnsureUI(); });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ if (!gUIReady) EnsureUI(); });
