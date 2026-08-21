@@ -54,8 +54,8 @@ static BOOL On(void) {
 }
 static NSInteger DelayMs(void) {
     NSInteger v = [UD() integerForKey:kDly];
-    if (v < 200) v = 200;
-    if (v > 3000) v = 3000;
+    if (v < 0) v = 0;
+    if (v > 2000) v = 2000;
     return v;
 }
 static NSArray *WL(void) { return [UD() arrayForKey:kWL] ?: @[]; }
@@ -326,6 +326,24 @@ static void hook_setAmt(id self, SEL _cmd, unsigned long long fen) {
     if (!ours) return;
     L(@"amount %llu fen hid=%@", fen, hid);
     Book(gLastConv, hid, (long long)fen, gLastWish);
+
+    // 不进详情：直接关所有窗口
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id mgr = Mgr();
+        CallV(mgr, @selector(closeHongBaoWindow));
+        CallV(mgr, @selector(closeResultWindow));
+        // dismiss detail VC if presented
+        @try {
+            UIViewController *vc = (UIViewController *)self;
+            if ([vc isKindOfClass:UIViewController.class]) {
+                if (vc.presentingViewController) {
+                    [vc.presentingViewController dismissViewControllerAnimated:NO completion:nil];
+                } else if (vc.navigationController && vc.navigationController.topViewController == vc) {
+                    [vc.navigationController popViewControllerAnimated:NO];
+                }
+            }
+        } @catch (__unused NSException *e) {}
+    });
 }
 
 #pragma mark - UI
@@ -367,18 +385,18 @@ static void hook_setAmt(id self, SEL _cmd, unsigned long long fen) {
     UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 55)];
     tip.numberOfLines = 4; tip.font = [UIFont systemFontOfSize:12];
     tip.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.5 alpha:1];
-    tip.text = @"v6: parseHB only (no OnAddMessage)\nmanual open untouched\nauto after delay via tony_onClick";
+    tip.text = @"v6: delay 0=fastest\nno detail window after grab\nmanual open untouched";
     [self.view addSubview:tip]; y += 60;
     UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 200, 24)];
-    dl.text = @"delay ms (min 200)"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
+    dl.text = @"delay ms (0=fastest)"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
     self.dLab = [[UILabel alloc] initWithFrame:CGRectMake(W - 90, y, 74, 24)];
     self.dLab.textAlignment = NSTextAlignmentRight;
     self.dLab.textColor = UIColor.lightGrayColor;
     self.dLab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [self.view addSubview:self.dLab]; y += 26;
     self.delay = [[UISlider alloc] initWithFrame:CGRectMake(16, y, W - 32, 30)];
-    self.delay.minimumValue = 200; self.delay.maximumValue = 2000;
-    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 200) dv = 300;
+    self.delay.minimumValue = 0; self.delay.maximumValue = 1000;
+    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 0) dv = 0;
     self.delay.value = (float)dv;
     [self.delay addTarget:self action:@selector(onD:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.delay];
