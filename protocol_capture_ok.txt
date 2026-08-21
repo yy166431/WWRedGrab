@@ -1,0 +1,42 @@
+{"t": "info", "msg": "OK WWRedEnvelopesMgr openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:"}
+{"t": "info", "msg": "OK WWRedEnvelopesMgr openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:"}
+{"t": "info", "msg": "OK WWRedEnvelopesMgr openHongBaoWindowForQueryResult:toVidList:hbTicket:vidTicket:conv:"}
+{"t": "info", "msg": "OK WWRedEnvOpenHongBaoWindow initWithData:toVidList:hbTicket:conv:"}
+{"t": "info", "msg": "OK WWRedEnvOpenHongBaoWindow initWithQueryResultData:toVidList:hbTicket:conv:"}
+{"t": "info", "msg": "OK WWRedEnvOpenHongBaoWindow onOpenBtnClick:"}
+{"t": "info", "msg": "OK WWRedEnvOpenHongBaoWindow _updateUIData"}
+{"t": "info", "msg": "skip WWRedEnvOpenHongBaoWindow _updateUIData:"}
+{"t": "info", "msg": "OK WWRedEnvelopesMgr didOpenRedEvnSuc:"}
+{"t": "info", "msg": "OK WWRedEnvOpenResultWindow _updateUIData:"}
+{"t": "info", "msg": "OK WWRedEnvOpenResultWindow initWithData:toVidList:hbTicket:conv:"}
+{"t": "info", "msg": "OK WWRedEnvDetailViewController setMSelfRecvAmount:"}
+{"t": "info", "msg": "OK WWRedEnvDetailViewController initWithUnWrapResultData:toVidList:isFromHistory:conv:"}
+{"t": "info", "msg": "OK WWRedEnvDetailViewController initWithGrabResultData:toVidList:isFromHistory:conv:"}
+{"t": "info", "msg": "READY no-click raw-only"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:", "self": "0x281109730", "a2": "0x2820891f0", "a3": "0x282b9f480", "a4": "0x283de3dc0", "a5": "0x0", "a6": "0x16d271c98", "a7": "0x16d271c90", "a8": "0x0", "vidTicket": 0, "a4p0": "054650947b40fc517d2fe01ad3176564273c4e1af2ffe4ad80cdd4cf3d677c77adf001e3f284ffa4"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:", "self": "0x281109730", "a2": "0x2820891f0", "a3": "0x282b9f480", "a4": "0x283de3dc0", "a5": "0x0", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x0", "vidTicket": 0, "a4p0": "054650947b40fc517d2fe01ad3176564273c4e1af2ffe4ad80cdd4cf3d677c77adf001e3f284ffa4"}
+{"t": "winInit", "sel": "initWithData:toVidList:hbTicket:conv:", "self": "0x137035c00", "a2": "0x2820891f0", "a3": "0x282b9f480", "a4": "0x283de3dc0", "a5": "0x16d271940", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x16d271c10", "a4p0": "054650947b40fc517d2fe01ad3176564273c4e1af2ffe4ad80cdd4cf3d677c77adf001e3f284ffa4"}
+{"t": "openUI", "sel": "_updateUIData", "self": "0x137035c00", "a2": "0x16d2717a0", "a3": "0x1a5f55188", "a4": "0x62dc", "a5": "0x0", "a6": "0x1", "a7": "0x1", "a8": "0x137035c00"}
+{"t": "openBtn", "sel": "onOpenBtnClick:", "self": "0x137035c00", "a2": "0x13824a250", "a3": "0x280c5b780", "a4": "0x280c5b780", "a5": "0x280c5b780", "a6": "0x2837d3690", "a7": "0x0", "a8": "0x280c5b780"}
+{"t": "detailInit", "sel": "initWithUnWrapResultData:toVidList:isFromHistory:conv:", "self": "0x13701c000", "a2": "0x2820ee6b0", "a3": "0x1f9ff16a8", "a4": "0x0", "a5": "0x16d271ed0", "a6": "0x35333030393430", "a7": "0x2802281a0", "a8": "0x1f98bc000"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x13701c000", "a2": "0x1", "a3": "0x1", "a4": "0x281c97380", "a5": "0x20", "a6": "0x0", "a7": "0x0", "a8": "0x1", "fen": "0x1"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x13701c000", "a2": "0x1", "a3": "0x1", "a4": "0x28133d1c0", "a5": "0x20", "a6": "0x0", "a7": "0x281331c80", "a8": "0x0", "fen": "0x1"}
+{"t": "success", "sel": "didOpenRedEvnSuc:", "self": "0x281109730", "a2": "0x282a40450", "a3": "0x282a40450", "a4": "0x281109730", "a5": "0x0", "a6": "0x16d2713c4", "a7": "0x16d2713b8", "a8": "0x16d2713f0"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:", "self": "0x281109730", "a2": "0x282319d30", "a3": "0x282b40330", "a4": "0x283dfc200", "a5": "0x0", "a6": "0x16d271c98", "a7": "0x16d271c90", "a8": "0x0", "vidTicket": 0, "a4p0": "e576f64ffd1429f68197f95ef2bfbed65f19f226ae9a329c6f8db84e527139422f8360582770c31f"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:", "self": "0x281109730", "a2": "0x282319d30", "a3": "0x282b40330", "a4": "0x283dfc200", "a5": "0x0", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x0", "vidTicket": 0, "a4p0": "e576f64ffd1429f68197f95ef2bfbed65f19f226ae9a329c6f8db84e527139422f8360582770c31f"}
+{"t": "winInit", "sel": "initWithData:toVidList:hbTicket:conv:", "self": "0x13783a800", "a2": "0x282319d30", "a3": "0x282b40330", "a4": "0x283dfc200", "a5": "0x16d271940", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x16d271c10", "a4p0": "e576f64ffd1429f68197f95ef2bfbed65f19f226ae9a329c6f8db84e527139422f8360582770c31f"}
+{"t": "openUI", "sel": "_updateUIData", "self": "0x13783a800", "a2": "0x16d2717a0", "a3": "0x1a5f55188", "a4": "0x62dc", "a5": "0x0", "a6": "0x1", "a7": "0x1", "a8": "0x13783a800"}
+{"t": "openBtn", "sel": "onOpenBtnClick:", "self": "0x13783a800", "a2": "0x13812f3e0", "a3": "0x280c5b780", "a4": "0x280c5b780", "a5": "0x280c5b780", "a6": "0x283427180", "a7": "0x8", "a8": "0x280c5b780"}
+{"t": "detailInit", "sel": "initWithUnWrapResultData:toVidList:isFromHistory:conv:", "self": "0x131833000", "a2": "0x282ccc0f0", "a3": "0x1f9ff16a8", "a4": "0x0", "a5": "0x16d271ed0", "a6": "0x33363038363631", "a7": "0x2802281a0", "a8": "0x1f98bc000"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x131833000", "a2": "0x1", "a3": "0x1", "a4": "0x281cde900", "a5": "0x20", "a6": "0x0", "a7": "0x0", "a8": "0x1", "fen": "0x1"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x131833000", "a2": "0x1", "a3": "0x1", "a4": "0x281cc7ec0", "a5": "0x20", "a6": "0x0", "a7": "0x281dcb960", "a8": "0x0", "fen": "0x1"}
+{"t": "success", "sel": "didOpenRedEvnSuc:", "self": "0x281109730", "a2": "0x282a35050", "a3": "0x282a35050", "a4": "0x281109730", "a5": "0x0", "a6": "0x16d2713c4", "a7": "0x16d2713b8", "a8": "0x16d2713f0"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:", "self": "0x281109730", "a2": "0x2822d30b0", "a3": "0x282b403c0", "a4": "0x283df7e60", "a5": "0x0", "a6": "0x16d271c98", "a7": "0x16d271c90", "a8": "0x0", "vidTicket": 0, "a4p0": "beafeb675b6684e66055c7f710656e9e1837e6a4140040e75112122259d7d5e4227750546ce97362"}
+{"t": "openWin", "sel": "openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:", "self": "0x281109730", "a2": "0x2822d30b0", "a3": "0x282b403c0", "a4": "0x283df7e60", "a5": "0x0", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x0", "vidTicket": 0, "a4p0": "beafeb675b6684e66055c7f710656e9e1837e6a4140040e75112122259d7d5e4227750546ce97362"}
+{"t": "winInit", "sel": "initWithData:toVidList:hbTicket:conv:", "self": "0x137040200", "a2": "0x2822d30b0", "a3": "0x282b403c0", "a4": "0x283df7e60", "a5": "0x16d271940", "a6": "0x16d271c18", "a7": "0x16d271c10", "a8": "0x16d271c10", "a4p0": "beafeb675b6684e66055c7f710656e9e1837e6a4140040e75112122259d7d5e4227750546ce97362"}
+{"t": "openUI", "sel": "_updateUIData", "self": "0x137040200", "a2": "0x16d2717a0", "a3": "0x1a5f55188", "a4": "0x62dc", "a5": "0x0", "a6": "0x1", "a7": "0x1", "a8": "0x137040200"}
+{"t": "openBtn", "sel": "onOpenBtnClick:", "self": "0x137040200", "a2": "0x13077ae20", "a3": "0x280c5b780", "a4": "0x280c5b780", "a5": "0x280c5b780", "a6": "0x282b88cc0", "a7": "0x8", "a8": "0x280c5b780"}
+{"t": "detailInit", "sel": "initWithUnWrapResultData:toVidList:isFromHistory:conv:", "self": "0x137008800", "a2": "0x2822d5770", "a3": "0x1f9ff16a8", "a4": "0x0", "a5": "0x16d271ed0", "a6": "0x38363235333837", "a7": "0x2802281a0", "a8": "0x1f98bc000"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x137008800", "a2": "0x1", "a3": "0x1", "a4": "0x281320fc0", "a5": "0x20", "a6": "0x0", "a7": "0x0", "a8": "0x1", "fen": "0x1"}
+{"t": "selfAmount", "sel": "setMSelfRecvAmount:", "self": "0x137008800", "a2": "0x1", "a3": "0x1", "a4": "0x281336f40", "a5": "0x20", "a6": "0x0", "a7": "0x281cd5e60", "a8": "0x0", "fen": "0x1"}
+{"t": "success", "sel": "didOpenRedEvnSuc:", "self": "0x281109730", "a2": "0x282a18fc0", "a3": "0x282a18fc0", "a4": "0x281109730", "a5": "0x0", "a6": "0x16d2713c4", "a7": "0x16d2713b8", "a8": "0x16d2713f0"}

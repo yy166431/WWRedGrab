@@ -2,1046 +2,866 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <mach-o/dyld.h>
-#import <mach-o/getsect.h>
-#import <sys/mman.h>
 #import <pthread.h>
-#import <QuartzCore/QuartzCore.h>
-#import <libkern/OSCacheControl.h>
-#import <string.h>
-#import <stdlib.h>
+#import <os/lock.h>
 
 /*
- * WWRedGrab - protocol layer grab for WeCom
+ * WWRedGrab — pure protocol silent grab (WeCom iOS)
  *
- * Binary (5.0.10): preferred base 0x100000000
- *   SendGrabHongBao   @ 0x100bca7bc  (redenvelopes_protocol_backend)
- *   SendUnWrapHongBao @ 0x100bcad00
- *
- * Args (ARM64, from disasm + logs):
- *   x0 = protocol backend this
- *   x1 = hongbaoId  (std::string* or equivalent pointer logged as string)
- *   x2 = hbticket
- *   x3 = (extra / to_vid related)
- *   x4/x5/x6 = sceneid etc (see wrappers)
+ * Verified chain (Frida capture, no C-prologue hooks):
+ *   OnAddMessage / bubble
+ *     -> tony_onClickHongbaoMessage          // internal SendGrab
+ *     -> openHongBaoWindow(data, vids, ticket, 0, conv, msg)
+ *        hbTicket = *(char**)a4  // 80-hex string
+ *     -> onOpenBtnClick:                    // SendUnWrap
+ *     -> setMSelfRecvAmount:                // fen
+ *     -> didOpenRedEvnSuc:
  *
  * Strategy:
- *  1) Inline-hook SendGrab/SendUnWrap → steal `this` + last tickets
- *  2) On new HB msg → if this ready, call SendGrab+SendUnWrap DIRECTLY (no bubble/window)
- *  3) Fallback: tony_onClick + openBlock (still no window) until this captured
+ *   1) Detect HB message ASAP
+ *   2) Fire tony_onClick (Grab) with delay 0
+ *   3) Intercept openHongBaoWindow → build OFFSCREEN window → onOpenBtnClick → kill UI
+ *   4) Never depend on openBlock (often NULL)
  */
 
-#pragma mark - Config keys
+#pragma mark - Config
 
-static NSString * const kCfgEnabled   = @"wwrg_enabled";
-static NSString * const kCfgDelayMs   = @"wwrg_delay_ms";
-static NSString * const kCfgWhitelist = @"wwrg_whitelist";
-static NSString * const kCfgTotalFen  = @"wwrg_total_fen";
-static NSString * const kCfgGrabCount = @"wwrg_grab_count";
-static NSString * const kCfgHistory   = @"wwrg_history";
-static NSString * const kCfgBallX     = @"wwrg_ball_x";
-static NSString * const kCfgBallY     = @"wwrg_ball_y";
-
-// file offsets from wework binary (unslid VA - 0x100000000)
-static const uint64_t kOff_SendGrab   = 0xbca7bcULL;
-static const uint64_t kOff_SendUnWrap = 0xbcad00ULL;
+static NSString * const kEn   = @"wwrg_enabled";
+static NSString * const kDly  = @"wwrg_delay_ms";
+static NSString * const kWL   = @"wwrg_whitelist";
+static NSString * const kFen  = @"wwrg_total_fen";
+static NSString * const kCnt  = @"wwrg_grab_count";
+static NSString * const kHis  = @"wwrg_history";
+static NSString * const kBX   = @"wwrg_ball_x";
+static NSString * const kBY   = @"wwrg_ball_y";
 
 #pragma mark - State
 
 static UIButton *gBall;
-static UIWindow *gPanelWin;
-static NSMutableSet *gDone;
-static NSMutableSet *gPending;
-static NSMutableSet *gCounted;
-static NSObject *gLock;
+static UIWindow *gPanel;
 static BOOL gUIReady;
-
-static void *gProtoThis = NULL;          // stolen backend this
-static void *gSlideBase = NULL;          // slid image base
+static NSObject *gLock;
+static NSMutableSet *gDone;     // hongbaoID done
+static NSMutableSet *gPending;
+static NSMutableSet *gAmtDone;  // amount booked
 static NSString *gLastHid;
 static NSString *gLastConv;
 static NSString *gLastWish;
 static NSString *gLastTicket;
 
-// original function prologues
-typedef uint64_t (*WWRG_SendGrab_t)(void *thiz, void *a1, void *a2, void *a3, void *a4, void *a5);
-typedef uint64_t (*WWRG_SendUnWrap_t)(void *thiz, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6);
+@interface WWRedGrabKeep : NSObject @end
+@implementation WWRedGrabKeep @end
 
-static WWRG_SendGrab_t   gOrigGrab = NULL;
-static WWRG_SendUnWrap_t gOrigUnWrap = NULL;
-static uint8_t gGrabTramp[32];
-static uint8_t gUnWrapTramp[32];
-static BOOL gHooked = NO;
+#pragma mark - Utils
 
-#pragma mark - Log / defaults
-
-static void WWRGLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
-static void WWRGLog(NSString *fmt, ...) {
+static void L(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void L(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    NSLog(@"[WWRedGrab] %@", [[NSString alloc] initWithFormat:fmt arguments:ap]);
     va_end(ap);
-    NSLog(@"[WWRedGrab] %@", s);
 }
 
 static NSUserDefaults *D(void) { return NSUserDefaults.standardUserDefaults; }
-static BOOL WWRGOn(void) {
-    if (![D() objectForKey:kCfgEnabled]) return YES;
-    return [D() boolForKey:kCfgEnabled];
+static BOOL On(void) {
+    if (![D() objectForKey:kEn]) return YES;
+    return [D() boolForKey:kEn];
 }
-static NSInteger WWRGDelay(void) {
-    NSInteger v = [D() integerForKey:kCfgDelayMs];
+static NSInteger DelayMs(void) {
+    NSInteger v = [D() integerForKey:kDly];
     if (v < 0) v = 0; if (v > 2000) v = 2000; return v;
 }
-static NSArray *WWRGWL(void) { return [D() arrayForKey:kCfgWhitelist] ?: @[]; }
-static void WWRGSetWL(NSArray *a) { [D() setObject:a?:@[] forKey:kCfgWhitelist]; [D() synchronize]; }
-static long long WWRGFenTotal(void) { return (long long)[D() integerForKey:kCfgTotalFen]; }
-static NSInteger WWRGCnt(void) { return [D() integerForKey:kCfgGrabCount]; }
-static NSString *WWRGYuan(long long fen) { return [NSString stringWithFormat:@"%.2f", fen/100.0]; }
+static NSArray *WL(void) { return [D() arrayForKey:kWL] ?: @[]; }
+static void SetWL(NSArray *a) { [D() setObject:a ?: @[] forKey:kWL]; [D() synchronize]; }
+static long long TotalFen(void) { return (long long)[D() integerForKey:kFen]; }
+static NSInteger GrabCnt(void) { return [D() integerForKey:kCnt]; }
+static NSString *Yuan(long long fen) { return [NSString stringWithFormat:@"%.2f", fen / 100.0]; }
 
-static BOOL WWRGIsWL(NSString *name) {
-    if (!name.length) return NO;
+static BOOL IsWL(NSString *name) {
+    if (name.length == 0) return NO;
     NSString *n = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    for (NSString *w in WWRGWL()) {
+    for (NSString *w in WL()) {
         NSString *t = [w stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!t.length) continue;
-        if ([n isEqualToString:t] || [n containsString:t] || [t containsString:n]) return YES;
+        if (t.length && ([n isEqualToString:t] || [n containsString:t] || [t containsString:n])) return YES;
     }
     return NO;
 }
 
-static BOOL WWRGBegin(NSString *hid) {
-    if (!hid.length) return NO;
+static BOOL Begin(NSString *hid) {
+    if (hid.length == 0) return NO;
     @synchronized (gLock) {
         if ([gDone containsObject:hid] || [gPending containsObject:hid]) return NO;
-        [gPending addObject:hid]; return YES;
+        [gPending addObject:hid];
+        return YES;
     }
 }
-static void WWRGEnd(NSString *hid) {
+static void End(NSString *hid) {
     if (!hid.length) return;
     @synchronized (gLock) {
         [gPending removeObject:hid];
         [gDone addObject:hid];
     }
 }
-static void WWRGCancel(NSString *hid) {
+static void Cancel(NSString *hid) {
     if (!hid.length) return;
     @synchronized (gLock) { [gPending removeObject:hid]; }
 }
 
-static id WWRGCall(id o, SEL s) {
+static id Call(id o, SEL s) {
     if (!o || !s || ![o respondsToSelector:s]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(o, s);
 }
-static void WWRGCallV(id o, SEL s) {
+static void CallV(id o, SEL s) {
     if (!o || !s || ![o respondsToSelector:s]) return;
     ((void (*)(id, SEL))objc_msgSend)(o, s);
 }
-static unsigned long long WWRGCallQ(id o, SEL s) {
+static unsigned long long CallQ(id o, SEL s) {
     if (!o || !s || ![o respondsToSelector:s]) return 0;
     return ((unsigned long long (*)(id, SEL))objc_msgSend)(o, s);
 }
-
-static long long WWRGParseFen(NSString *s) {
-    if (!s.length) return 0;
-    NSMutableString *m = [NSMutableString string];
-    BOOL dot = NO;
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar c = [s characterAtIndex:i];
-        if (c >= '0' && c <= '9') [m appendFormat:@"%C", c];
-        else if (c == '.' && !dot) { [m appendString:@"."]; dot = YES; }
-    }
-    if (!m.length) return 0;
-    return (long long)llround(m.doubleValue * 100.0);
+static int CallI(id o, SEL s) {
+    if (!o || !s || ![o respondsToSelector:s]) return 0;
+    return ((int (*)(id, SEL))objc_msgSend)(o, s);
 }
 
-static void WWRGRefreshBall(void);
+static void RefreshBall(void);
 
-static void WWRGBook(NSString *conv, NSString *hid, long long fen, NSString *wish) {
+static void Book(NSString *conv, NSString *hid, long long fen, NSString *wish) {
     if (hid.length) {
         @synchronized (gLock) {
-            if ([gCounted containsObject:hid]) { WWRGEnd(hid); return; }
-            [gCounted addObject:hid];
+            if ([gAmtDone containsObject:hid]) { End(hid); return; }
+            [gAmtDone addObject:hid];
         }
-        WWRGEnd(hid);
+        End(hid);
     }
     if (fen < 0) fen = 0;
-    NSMutableArray *arr = [[D() arrayForKey:kCfgHistory] mutableCopy] ?: [NSMutableArray array];
+    NSMutableArray *arr = [[D() arrayForKey:kHis] mutableCopy] ?: [NSMutableArray array];
     [arr insertObject:@{
         @"t": @(NSDate.date.timeIntervalSince1970),
-        @"conv": conv ?: @"", @"hid": hid ?: @"",
-        @"fen": @(fen), @"wish": wish ?: @""
+        @"conv": conv ?: @"",
+        @"hid": hid ?: @"",
+        @"fen": @(fen),
+        @"wish": wish ?: @""
     } atIndex:0];
     while (arr.count > 150) [arr removeLastObject];
-    [D() setObject:arr forKey:kCfgHistory];
-    if (fen > 0) [D() setInteger:(NSInteger)(WWRGFenTotal() + fen) forKey:kCfgTotalFen];
-    [D() setInteger:WWRGCnt() + 1 forKey:kCfgGrabCount];
+    [D() setObject:arr forKey:kHis];
+    if (fen > 0) [D() setInteger:(NSInteger)(TotalFen() + fen) forKey:kFen];
+    [D() setInteger:GrabCnt() + 1 forKey:kCnt];
     [D() synchronize];
-    WWRGLog(@"入账 ¥%@ (%lld分) hid=%@ conv=%@", WWRGYuan(fen), fen, hid, conv);
-    dispatch_async(dispatch_get_main_queue(), ^{ WWRGRefreshBall(); });
+    L(@"入账 ¥%@ (%lld分) hid=%@ conv=%@", Yuan(fen), fen, hid, conv);
+    dispatch_async(dispatch_get_main_queue(), ^{ RefreshBall(); });
 }
 
-#pragma mark - ARM64 inline hook
+#pragma mark - Swizzle
 
-static BOOL WWRGMakeRx(void *p, size_t n) {
-    uintptr_t start = (uintptr_t)p & ~0x3FFFULL;
-    uintptr_t end = ((uintptr_t)p + n + 0x3FFF) & ~0x3FFFULL;
-    return mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
-}
-
-// write: LDR X16, #8; BR X16; .quad target
-static void WWRGWriteAbsJump(void *at, void *target) {
-    uint32_t *p = (uint32_t *)at;
-    p[0] = 0x58000050; // LDR X16, #8
-    p[1] = 0xD61F0200; // BR X16
-    memcpy(p + 2, &target, 8);
-}
-
-// trampoline: first 16 bytes original, then jump to orig+16
-static void *WWRGBuildTramp(void *func, uint8_t *buf) {
-    memcpy(buf, func, 16);
-    WWRGWriteAbsJump(buf + 16, (uint8_t *)func + 16);
-    // clear i-cache
-    sys_icache_invalidate(buf, 32);
-    return buf;
-}
-
-static uint64_t WWRGHookedGrab(void *thiz, void *a1, void *a2, void *a3, void *a4, void *a5) {
-    if (thiz) {
-        gProtoThis = thiz;
-        WWRGLog(@"捕获 protocol this=%p (Grab)", thiz);
-    }
-    // try interpret a1 as NSString* or CFString
-    id s1 = (__bridge id)a1;
-    if ([s1 isKindOfClass:NSString.class]) {
-        gLastHid = [s1 copy];
-        WWRGLog(@"Grab hid=%@", s1);
-    }
-    id s2 = (__bridge id)a2;
-    if ([s2 isKindOfClass:NSString.class]) {
-        gLastTicket = [s2 copy];
-        WWRGLog(@"Grab ticket=%@", s2);
-    }
-    return gOrigGrab(thiz, a1, a2, a3, a4, a5);
-}
-
-static uint64_t WWRGHookedUnWrap(void *thiz, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
-    if (thiz) {
-        gProtoThis = thiz;
-        WWRGLog(@"捕获 protocol this=%p (UnWrap)", thiz);
-    }
-    id s1 = (__bridge id)a1;
-    if ([s1 isKindOfClass:NSString.class]) {
-        gLastHid = [s1 copy];
-        WWRGLog(@"UnWrap hid=%@", s1);
-    }
-    id s2 = (__bridge id)a2;
-    if ([s2 isKindOfClass:NSString.class]) {
-        gLastTicket = [s2 copy];
-        WWRGLog(@"UnWrap ticket=%@", s2);
-    }
-    uint64_t r = gOrigUnWrap(thiz, a1, a2, a3, a4, a5, a6);
-    // unwrap success often followed by amount callbacks
-    return r;
-}
-
-static void *WWRGFindWeworkBase(void) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (!nm) continue;
-        // main executable often ends with /wework
-        if (strstr(nm, "/wework") || strstr(nm, "wework.app/wework")) {
-            const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            WWRGLog(@"wework image %s slide=0x%lx hdr=%p", nm, (long)slide, hdr);
-            return (void *)((uintptr_t)0x100000000ULL + slide);
-        }
-    }
-    // fallback: image 0
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    WWRGLog(@"fallback image0 slide=0x%lx", (long)slide);
-    return (void *)((uintptr_t)0x100000000ULL + slide);
-}
-
-static BOOL WWRGInstallCHooks(void) {
-    if (gHooked) return YES;
-    gSlideBase = WWRGFindWeworkBase();
-    if (!gSlideBase) return NO;
-
-    void *grab = (uint8_t *)gSlideBase + kOff_SendGrab;
-    void *unwrap = (uint8_t *)gSlideBase + kOff_SendUnWrap;
-    WWRGLog(@"SendGrab @ %p  SendUnWrap @ %p", grab, unwrap);
-
-    // sanity: first insn should look like SUB SP or STP
-    uint32_t g0 = *(uint32_t *)grab;
-    uint32_t u0 = *(uint32_t *)unwrap;
-    WWRGLog(@"Grab head %08x UnWrap head %08x", g0, u0);
-
-    if (!WWRGMakeRx(grab, 16) || !WWRGMakeRx(unwrap, 16)) {
-        WWRGLog(@"mprotect fail");
-        return NO;
-    }
-    if (!WWRGMakeRx(gGrabTramp, 32) || !WWRGMakeRx(gUnWrapTramp, 32)) {
-        WWRGLog(@"tramp mprotect fail");
-        return NO;
-    }
-
-    gOrigGrab = (WWRG_SendGrab_t)WWRGBuildTramp(grab, gGrabTramp);
-    gOrigUnWrap = (WWRG_SendUnWrap_t)WWRGBuildTramp(unwrap, gUnWrapTramp);
-
-    WWRGWriteAbsJump(grab, (void *)WWRGHookedGrab);
-    WWRGWriteAbsJump(unwrap, (void *)WWRGHookedUnWrap);
-    sys_icache_invalidate(grab, 16);
-    sys_icache_invalidate(unwrap, 16);
-
-    gHooked = YES;
-    WWRGLog(@"C函数 hook 完成 (协议层)");
-    return YES;
-}
-
-// Direct protocol call — a1/a2 as NSString* tried first (many WW paths pass NSString*)
-static void WWRGProtoGrab(NSString *hid, NSString *ticket) {
-    if (!gHooked || !gOrigGrab) { WWRGLog(@"Grab orig 未就绪"); return; }
-    if (!gProtoThis) { WWRGLog(@"protocol this 未捕获, 等一次系统调用或走 fallback"); return; }
-    if (!hid.length) return;
-
-    WWRGLog(@"协议直调 SendGrab hid=%@ ticket=%@ this=%p", hid, ticket, gProtoThis);
-
-    // Pass NSString* — if backend expects std::string*, this may fail; fallback path handles.
-    // Many Tencent iOS paths use NSString* at the ObjC→C++ boundary before conversion.
-    void *pHid = (__bridge void *)hid;
-    void *pTk  = (__bridge void *)(ticket ?: @"");
-    // sceneid often 0 / small int in x4 or x5 — pass 0
-    @try {
-        gOrigGrab(gProtoThis, pHid, pTk, NULL, NULL, NULL);
-    } @catch (NSException *ex) {
-        WWRGLog(@"Grab 异常 %@", ex);
-    }
-}
-
-static void WWRGProtoUnWrap(NSString *hid, NSString *ticket) {
-    if (!gHooked || !gOrigUnWrap || !gProtoThis) return;
-    if (!hid.length) return;
-    WWRGLog(@"协议直调 SendUnWrap hid=%@ ticket=%@", hid, ticket);
-    void *pHid = (__bridge void *)hid;
-    void *pTk  = (__bridge void *)(ticket ?: gLastTicket ?: @"");
-    @try {
-        gOrigUnWrap(gProtoThis, pHid, pTk, NULL, NULL, NULL, NULL);
-    } @catch (NSException *ex) {
-        WWRGLog(@"UnWrap 异常 %@", ex);
-    }
-}
-
-#pragma mark - Swizzle helpers
-
-static void WWRGSwizzle(Class cls, SEL o, SEL n) {
-    if (!cls) return;
-    Method om = class_getInstanceMethod(cls, o);
-    Method nm = class_getInstanceMethod(cls, n);
-    if (!om || !nm) return;
-    if (class_addMethod(cls, o, method_getImplementation(nm), method_getTypeEncoding(nm)))
-        class_replaceMethod(cls, n, method_getImplementation(om), method_getTypeEncoding(om));
+static void Swizzle(Class c, SEL o, SEL n) {
+    if (!c) return;
+    Method om = class_getInstanceMethod(c, o);
+    Method nm = class_getInstanceMethod(c, n);
+    if (!om || !nm) { L(@"swizzle miss %@ %s", c, sel_getName(o)); return; }
+    if (class_addMethod(c, o, method_getImplementation(nm), method_getTypeEncoding(nm)))
+        class_replaceMethod(c, n, method_getImplementation(om), method_getTypeEncoding(om));
     else method_exchangeImplementations(om, nm);
-    WWRGLog(@"swizzle %@ %s", cls, sel_getName(o));
+    L(@"hook %@ %s", c, sel_getName(o));
 }
 
-static void WWRGHook(Class cls, SEL o, SEL n, id block) {
-    if (!cls || !class_getInstanceMethod(cls, o)) return;
-    Method om = class_getInstanceMethod(cls, o);
-    class_addMethod(cls, n, imp_implementationWithBlock(block), method_getTypeEncoding(om));
-    WWRGSwizzle(cls, o, n);
+static void Hook(Class c, SEL o, SEL n, id block) {
+    if (!c || !class_getInstanceMethod(c, o)) { L(@"no %@ %s", c, sel_getName(o)); return; }
+    Method om = class_getInstanceMethod(c, o);
+    class_addMethod(c, n, imp_implementationWithBlock(block), method_getTypeEncoding(om));
+    Swizzle(c, o, n);
 }
 
-#pragma mark - Message → protocol grab
+#pragma mark - Ticket helpers
 
-static BOOL WWRGIsHB(id item) {
-    if (!item) return NO;
-    NSString *cn = NSStringFromClass([item class]);
-    if ([cn containsString:@"MessageRedEnvelopes"] || [cn containsString:@"LishiRedEnvelopes"]) return YES;
-    return class_getInstanceMethod([item class], @selector(hongbaoID)) != NULL;
-}
-static NSString *WWRGHidOf(id item) {
-    id h = WWRGCall(item, @selector(hongbaoID));
-    return [h isKindOfClass:NSString.class] ? h : nil;
-}
-static NSString *WWRGWishOf(id item) {
-    id w = WWRGCall(item, @selector(wishingWording));
-    if ([w isKindOfClass:NSString.class]) return w;
-    w = WWRGCall(item, @selector(lishingWording));
-    return [w isKindOfClass:NSString.class] ? w : @"";
-}
-static NSString *WWRGTicketOf(id item) {
-    id t = WWRGCall(item, @selector(hbTicket));
-    if ([t isKindOfClass:NSString.class] && [t length]) return t;
-    // try KVC common names
+// hbTicket arg is r^v — observed as pointer whose *value is C string / or NSString / or std::string-like
+static NSString *TicketFromPtr(const void *p) {
+    if (!p) return nil;
+    // try as NSString*
     @try {
-        t = [item valueForKey:@"hbTicket"];
-        if ([t isKindOfClass:NSString.class] && [t length]) return t;
+        id o = (__bridge id)p;
+        if ([o isKindOfClass:NSString.class] && [(NSString *)o length] > 0) return o;
     } @catch (__unused NSException *e) {}
+    // try *p as char*
     @try {
-        t = [item valueForKey:@"mHongbaoTicket"];
-        if ([t isKindOfClass:NSString.class] && [t length]) return t;
+        const char *s = *(const char * const *)p;
+        if (s && s[0]) {
+            NSString *t = [NSString stringWithUTF8String:s];
+            if (t.length > 8) return t;
+        }
     } @catch (__unused NSException *e) {}
-    return gLastTicket;
+    // try p as char*
+    @try {
+        const char *s = (const char *)p;
+        // sanity printable
+        if (s && s[0] && (unsigned char)s[0] >= 0x20) {
+            NSString *t = [NSString stringWithUTF8String:s];
+            if (t.length > 8 && t.length < 200) return t;
+        }
+    } @catch (__unused NSException *e) {}
+    // std::string SSO
+    @try {
+        const uint8_t *b = (const uint8_t *)p;
+        uint8_t b0 = b[0];
+        NSUInteger sz = b0 >> 1;
+        if ((b0 & 1) == 0 && sz > 8 && sz < 23) {
+            return [[NSString alloc] initWithBytes:b + 1 length:sz encoding:NSUTF8StringEncoding];
+        }
+        // long string: data ptr often at +8/+16
+        for (int off = 8; off <= 16; off += 8) {
+            const char *s = *(const char * const *)(b + off);
+            if (s && s[0]) {
+                NSString *t = [NSString stringWithUTF8String:s];
+                if (t.length > 8) return t;
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
 }
 
-static void WWRGFallbackTony(id msg, NSString *hid) {
-    Class bubbleCls = NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
-    if (!bubbleCls) { WWRGCancel(hid); return; }
-    id bubble = [[bubbleCls alloc] init];
-    if ([bubble respondsToSelector:@selector(setMessage:)])
-        ((void (*)(id, SEL, id))objc_msgSend)(bubble, @selector(setMessage:), msg);
-    else if ([bubble respondsToSelector:@selector(setMessage:withItemIndex:)])
-        ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(bubble, @selector(setMessage:withItemIndex:), msg, 0);
-    if ([bubble respondsToSelector:@selector(tony_onClickHongbaoMessage)])
-        WWRGCallV(bubble, @selector(tony_onClickHongbaoMessage));
-    else
-        WWRGCallV(bubble, @selector(onClickHongbaoMessage));
-    objc_setAssociatedObject(msg, "wwrg_keep", bubble, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        objc_setAssociatedObject(msg, "wwrg_keep", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    });
-    WWRGLog(@"fallback tony_onClick (仍无窗, 仅参数组装)");
+static void NukeView(UIView *v) {
+    if (!v) return;
+    v.hidden = YES;
+    v.alpha = 0;
+    v.userInteractionEnabled = NO;
+    v.frame = CGRectMake(-9000, -9000, 1, 1);
 }
 
-static void WWRGGrabMsg(id msg, NSString *conv) {
-    if (!WWRGOn() || !msg) return;
-    if (WWRGIsWL(conv)) { WWRGLog(@"白名单 %@", conv); return; }
+#pragma mark - Silent UnWrap via offscreen window
 
-    id item = WWRGCall(msg, @selector(messageItem));
-    if (!WWRGIsHB(item)) {
-        NSArray *items = WWRGCall(msg, @selector(messageItems));
-        if ([items isKindOfClass:NSArray.class])
-            for (id it in items) if (WWRGIsHB(it)) { item = it; break; }
+static void SilentUnWrap(const void *data, id toVidList, const void *hbTicket, const void *convRef) {
+    if (!On()) return;
+    Class winCls = NSClassFromString(@"WWRedEnvOpenHongBaoWindow");
+    if (!winCls) { L(@"no OpenHongBaoWindow class"); return; }
+
+    NSString *tk = TicketFromPtr(hbTicket);
+    if (tk.length) {
+        gLastTicket = [tk copy];
+        L(@"ticket=%@", tk);
     }
-    if (!WWRGIsHB(item)) return;
 
-    NSString *hid = WWRGHidOf(item);
-    if (!hid.length) hid = [NSString stringWithFormat:@"t%p%ld", msg, (long)time(NULL)];
-    if (!WWRGBegin(hid)) return;
-
-    NSString *wish = WWRGWishOf(item);
-    NSString *ticket = WWRGTicketOf(item);
-    gLastHid = [hid copy];
-    gLastConv = [conv ?: @"" copy];
-    gLastWish = [wish ?: @"" copy];
-    if (ticket.length) gLastTicket = [ticket copy];
-
-    WWRGLog(@"发现红包 hid=%@ ticket=%@ conv=%@ this=%p", hid, ticket, conv, gProtoThis);
-
+    // Must run on main — UIKit window object (hidden)
     void (^go)(void) = ^{
-        if (gProtoThis && gOrigGrab) {
-            // pure protocol path
-            WWRGProtoGrab(hid, ticket ?: gLastTicket);
-            // unwrap shortly after grab (server needs grab first)
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                WWRGProtoUnWrap(hid, gLastTicket ?: ticket);
+        @try {
+            id win = [winCls alloc];
+            SEL ini = @selector(initWithData:toVidList:hbTicket:conv:);
+            if (![win respondsToSelector:ini]) {
+                L(@"no initWithData:toVidList:hbTicket:conv:");
+                return;
+            }
+            // signature: id, SEL, r^v, id, r^v, scoped_refptr(8)
+            // pass conv as the raw 8-byte scoped_refptr value at convRef
+            win = ((id (*)(id, SEL, const void *, id, const void *, void *))objc_msgSend)(
+                win, ini, data, toVidList, hbTicket, (void *)convRef);
+            if (!win) { L(@"win init nil"); return; }
+
+            if ([win isKindOfClass:UIView.class]) NukeView((UIView *)win);
+            // force property ticket/id if available
+            if (tk.length && [win respondsToSelector:@selector(setMHongbaoTicket:)])
+                ((void (*)(id, SEL, id))objc_msgSend)(win, @selector(setMHongbaoTicket:), tk);
+            if (gLastHid.length && [win respondsToSelector:@selector(setMHongBaoID:)])
+                ((void (*)(id, SEL, id))objc_msgSend)(win, @selector(setMHongBaoID:), gLastHid);
+
+            objc_setAssociatedObject(win, "wwrg_silent", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+            // UnWrap = onOpenBtnClick
+            if ([win respondsToSelector:@selector(onOpenBtnClick:)]) {
+                L(@"协议 UnWrap onOpenBtnClick hid=%@", gLastHid);
+                ((void (*)(id, SEL, id))objc_msgSend)(win, @selector(onOpenBtnClick:), nil);
+            } else {
+                L(@"no onOpenBtnClick");
+            }
+
+            // keep alive briefly for async network
+            objc_setAssociatedObject([WWRedGrabKeep class], "keep", win, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                objc_setAssociatedObject([WWRedGrabKeep class], "keep", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                id mgr = Call(NSClassFromString(@"WWRedEnvelopesMgr"), @selector(shareInstance));
+                CallV(mgr, @selector(closeHongBaoWindow));
+                CallV(mgr, @selector(closeResultWindow));
             });
-            // second unwrap retry
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                WWRGProtoUnWrap(hid, gLastTicket ?: ticket);
-            });
-        } else {
-            // need one path to capture this + correct tickets
-            WWRGFallbackTony(msg, hid);
+        } @catch (NSException *ex) {
+            L(@"SilentUnWrap ex %@", ex);
         }
     };
 
-    NSInteger dly = WWRGDelay();
-    if (dly <= 0) {
+    if ([NSThread isMainThread]) go();
+    else dispatch_async(dispatch_get_main_queue(), go);
+}
+
+#pragma mark - Detect & Grab
+
+static BOOL IsHBItem(id item) {
+    if (!item) return NO;
+    NSString *cn = NSStringFromClass([item class]);
+    if ([cn containsString:@"MessageRedEnvelopes"] || [cn containsString:@"LishiRedEnvelopes"]) return YES;
+    return [item respondsToSelector:@selector(hongbaoID)];
+}
+
+static NSString *HidOf(id item) {
+    id h = Call(item, @selector(hongbaoID));
+    return [h isKindOfClass:NSString.class] ? h : nil;
+}
+static NSString *WishOf(id item) {
+    id w = Call(item, @selector(wishingWording));
+    if ([w isKindOfClass:NSString.class]) return w;
+    w = Call(item, @selector(lishingWording));
+    return [w isKindOfClass:NSString.class] ? w : @"";
+}
+
+static void FireGrab(id wwkMessage, NSString *conv) {
+    if (!On() || !wwkMessage) return;
+    if (IsWL(conv)) { L(@"白名单跳过 %@", conv); return; }
+
+    id item = Call(wwkMessage, @selector(messageItem));
+    if (!IsHBItem(item)) {
+        NSArray *items = Call(wwkMessage, @selector(messageItems));
+        if ([items isKindOfClass:NSArray.class]) {
+            for (id it in items) if (IsHBItem(it)) { item = it; break; }
+        }
+    }
+    if (!IsHBItem(item)) return;
+
+    NSString *hid = HidOf(item);
+    if (!hid.length) hid = [NSString stringWithFormat:@"t%p%ld", wwkMessage, (long)time(NULL)];
+    if (!Begin(hid)) return;
+
+    NSString *wish = WishOf(item);
+    gLastHid = [hid copy];
+    gLastConv = [conv ?: @"" copy];
+    gLastWish = [wish ?: @"" copy];
+    L(@"发现红包 协议抢 hid=%@ type=%@ sub=%@ conv=%@",
+      hid, @(CallQ(item, @selector(hongbaoType))), @(CallQ(item, @selector(hongbaoSubType))), conv);
+
+    void (^go)(void) = ^{
+        @try {
+            Class bcls = NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
+            if (!bcls) { Cancel(hid); return; }
+            id bubble = [[bcls alloc] init];
+            if ([bubble respondsToSelector:@selector(setMessage:)])
+                ((void (*)(id, SEL, id))objc_msgSend)(bubble, @selector(setMessage:), wwkMessage);
+            else if ([bubble respondsToSelector:@selector(setMessage:withItemIndex:)])
+                ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(bubble, @selector(setMessage:withItemIndex:), wwkMessage, 0);
+
+            // Grab network — tony_onClick
+            if ([bubble respondsToSelector:@selector(tony_onClickHongbaoMessage)]) {
+                CallV(bubble, @selector(tony_onClickHongbaoMessage));
+                L(@"SendGrab via tony_onClick hid=%@", hid);
+            } else if ([bubble respondsToSelector:@selector(onClickHongbaoMessage)]) {
+                CallV(bubble, @selector(onClickHongbaoMessage));
+                L(@"SendGrab via onClick hid=%@", hid);
+            } else {
+                Cancel(hid);
+                return;
+            }
+            // retain bubble until open window
+            objc_setAssociatedObject(wwkMessage, "wwrg_bubble", bubble, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                objc_setAssociatedObject(wwkMessage, "wwrg_bubble", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            });
+        } @catch (NSException *ex) {
+            L(@"FireGrab ex %@", ex);
+            Cancel(hid);
+        }
+    };
+
+    NSInteger d = DelayMs();
+    if (d <= 0) {
         if ([NSThread isMainThread]) go();
         else dispatch_async(dispatch_get_main_queue(), go);
     } else {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dly * NSEC_PER_MSEC)), dispatch_get_main_queue(), go);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_MSEC)), dispatch_get_main_queue(), go);
     }
 }
 
-static id WWRGWrapMsg(void *p) {
-    if (!p) return nil;
-    Class cls = NSClassFromString(@"WWKMessage");
-    if (!cls) return nil;
+static id WrapMsg(void *modelPtr) {
+    if (!modelPtr) return nil;
+    Class c = NSClassFromString(@"WWKMessage");
+    if (!c) return nil;
     @try {
-        void *tmp = p;
-        id o = [cls alloc];
-        if ([cls instancesRespondToSelector:@selector(initWithMessage:observe:)])
+        void *tmp = modelPtr;
+        id o = [c alloc];
+        if ([c instancesRespondToSelector:@selector(initWithMessage:observe:)])
             return ((id (*)(id, SEL, void *, BOOL))objc_msgSend)(o, @selector(initWithMessage:observe:), &tmp, NO);
-        if ([cls instancesRespondToSelector:@selector(initWithMessage:)])
+        if ([c instancesRespondToSelector:@selector(initWithMessage:)])
             return ((id (*)(id, SEL, void *))objc_msgSend)(o, @selector(initWithMessage:), &tmp);
     } @catch (__unused NSException *e) {}
     return nil;
 }
 
-typedef struct { void **begin; void **end; void **cap; } WWRGVec;
+typedef struct { void **begin; void **end; void **cap; } Vec;
 
-static void WWRGOnVec(const void *vec, NSString *conv) {
+static void OnVec(const void *vec, NSString *conv) {
     if (!vec) return;
-    const WWRGVec *v = (const WWRGVec *)vec;
+    const Vec *v = (const Vec *)vec;
     if (v->begin && v->end && v->end > v->begin) {
         ptrdiff_t n = v->end - v->begin;
-        if (n > 0 && n <= 100) {
+        if (n > 0 && n <= 80) {
             for (ptrdiff_t i = 0; i < n; i++) {
                 void *p = v->begin[i];
                 if (!p) continue;
-                id msg = WWRGWrapMsg(p);
+                id msg = WrapMsg(p);
                 if (!msg) continue;
-                WWRGCallV(msg, @selector(parseMessage));
-                WWRGGrabMsg(msg, conv);
+                CallV(msg, @selector(parseMessage));
+                FireGrab(msg, conv);
             }
             return;
         }
     }
     void *one = *(void * const *)vec;
     if (one) {
-        id msg = WWRGWrapMsg(one);
-        if (msg) { WWRGCallV(msg, @selector(parseMessage)); WWRGGrabMsg(msg, conv); }
+        id msg = WrapMsg(one);
+        if (msg) { CallV(msg, @selector(parseMessage)); FireGrab(msg, conv); }
     }
 }
 
-static NSString *WWRGName(id w) {
-    id n = WWRGCall(w, @selector(getName));
+static NSString *ConvName(id w) {
+    id n = Call(w, @selector(getName));
     return [n isKindOfClass:NSString.class] ? n : @"";
 }
 
-static long long WWRGFenFrom(id o) {
-    if (!o) return 0;
-    if ([o respondsToSelector:@selector(mSelfRecvAmount)]) {
-        unsigned long long a = WWRGCallQ(o, @selector(mSelfRecvAmount));
-        if (a > 0 && a < 100000000ULL) return (long long)a;
-    }
-    if ([o respondsToSelector:@selector(totalAmountYuanStr)]) {
-        id y = WWRGCall(o, @selector(totalAmountYuanStr));
-        if ([y isKindOfClass:NSString.class]) {
-            long long f = WWRGParseFen(y);
-            if (f > 0) return f;
-        }
-    }
-    if ([o respondsToSelector:@selector(mTotalAmount)]) {
-        unsigned long long a = WWRGCallQ(o, @selector(mTotalAmount));
-        if (a > 0 && a < 100000000ULL) return (long long)a;
-    }
-    if ([o isKindOfClass:NSString.class]) return WWRGParseFen((NSString *)o);
-    if ([o isKindOfClass:NSNumber.class]) return [(NSNumber *)o longLongValue];
-    return 0;
-}
+#pragma mark - Minimal settings ball (not red-packet UI)
 
-static void WWRGNuke(id v) {
-    if ([v isKindOfClass:UIView.class]) {
-        UIView *view = v;
-        view.hidden = YES; view.alpha = 0;
-        view.frame = CGRectMake(-9000,-9000,0,0);
-        view.userInteractionEnabled = NO;
-    }
-}
-static void WWRGNukeVC(UIViewController *vc) {
-    if (!vc) return;
-    WWRGNuke(vc.view);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            if (vc.presentingViewController) [vc dismissViewControllerAnimated:NO completion:nil];
-            else if (vc.navigationController.topViewController == vc)
-                [vc.navigationController popViewControllerAnimated:NO];
-        } @catch (__unused NSException *e) {}
-    });
-}
-
-static void WWRGInvokeBlock(id block) {
-    if (!block) return;
-    @try { void (^b)(void)=block; b(); return; } @catch(__unused NSException *e){}
-    @try { void (^b)(id)=block; b(nil); return; } @catch(__unused NSException *e){}
-    @try { void (^b)(BOOL)=block; b(YES); return; } @catch(__unused NSException *e){}
-}
-
-#pragma mark - UI panel
-
-@interface WWRGPanelController : UIViewController <UITableViewDelegate,UITableViewDataSource,UITextFieldDelegate>
-@property (nonatomic,strong) UISwitch *enSw;
-@property (nonatomic,strong) UISlider *delay;
-@property (nonatomic,strong) UILabel *delayLab;
-@property (nonatomic,strong) UILabel *stats;
-@property (nonatomic,strong) UILabel *protoLab;
-@property (nonatomic,strong) UITextField *field;
-@property (nonatomic,strong) UITableView *wlTable;
-@property (nonatomic,strong) UITableView *hisTable;
-@property (nonatomic,strong) NSMutableArray *wl;
-@property (nonatomic,strong) NSArray *his;
-@property (nonatomic,strong) UISegmentedControl *seg;
+@interface WWRGPanel : UIViewController <UITableViewDelegate, UITableViewDataSource, UITextFieldDelegate>
+@property (nonatomic, strong) UISwitch *en;
+@property (nonatomic, strong) UISlider *delay;
+@property (nonatomic, strong) UILabel *delayLab;
+@property (nonatomic, strong) UILabel *stats;
+@property (nonatomic, strong) UITextField *field;
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSMutableArray *wl;
 @end
 
-@implementation WWRGPanelController
+@implementation WWRGPanel
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.97];
-    self.wl = [WWRGWL() mutableCopy] ?: [NSMutableArray array];
-    self.his = [D() arrayForKey:kCfgHistory] ?: @[];
-    CGFloat W = self.view.bounds.size.width; CGFloat y = 52;
+    self.view.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.97];
+    self.wl = [WL() mutableCopy] ?: [NSMutableArray array];
+    CGFloat W = self.view.bounds.size.width, y = 50;
 
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16,14,W-100,30)];
-    t.text=@"企业微信秒抢红包"; t.textColor=UIColor.whiteColor;
-    t.font=[UIFont boldSystemFontOfSize:18]; t.autoresizingMask=UIViewAutoresizingFlexibleWidth;
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, W - 90, 28)];
+    t.text = @"秒抢 · 纯协议"; t.textColor = UIColor.whiteColor;
+    t.font = [UIFont boldSystemFontOfSize:17]; t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [self.view addSubview:t];
 
-    UIButton *c=[UIButton buttonWithType:UIButtonTypeSystem];
-    c.frame=CGRectMake(W-72,12,56,34); c.autoresizingMask=UIViewAutoresizingFlexibleLeftMargin;
+    UIButton *c = [UIButton buttonWithType:UIButtonTypeSystem];
+    c.frame = CGRectMake(W - 70, 12, 54, 32); c.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [c setTitle:@"关闭" forState:UIControlStateNormal]; [c setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [c addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:c];
 
-    UILabel *el=[[UILabel alloc] initWithFrame:CGRectMake(16,y,160,28)];
-    el.text=@"自动抢红包"; el.textColor=UIColor.whiteColor; el.font=[UIFont systemFontOfSize:16];
+    UILabel *el = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 120, 28)];
+    el.text = @"自动抢"; el.textColor = UIColor.whiteColor; el.font = [UIFont systemFontOfSize:16];
     [self.view addSubview:el];
-    self.enSw=[[UISwitch alloc] initWithFrame:CGRectMake(W-70,y,51,31)];
-    self.enSw.autoresizingMask=UIViewAutoresizingFlexibleLeftMargin; self.enSw.on=WWRGOn();
-    [self.enSw addTarget:self action:@selector(onEn:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.enSw]; y+=40;
+    self.en = [[UISwitch alloc] initWithFrame:CGRectMake(W - 70, y, 51, 31)];
+    self.en.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin; self.en.on = On();
+    [self.en addTarget:self action:@selector(onEn:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:self.en]; y += 42;
 
-    self.protoLab=[[UILabel alloc] initWithFrame:CGRectMake(16,y,W-32,36)];
-    self.protoLab.numberOfLines=2; self.protoLab.font=[UIFont systemFontOfSize:12];
-    self.protoLab.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    [self.view addSubview:self.protoLab]; [self refProto]; y+=40;
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 36)];
+    tip.text = @"无红包弹窗 · Grab→截ticket→UnWrap";
+    tip.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.45 alpha:1];
+    tip.font = [UIFont systemFontOfSize:12]; tip.numberOfLines = 2;
+    tip.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:tip]; y += 40;
 
-    UILabel *dl=[[UILabel alloc] initWithFrame:CGRectMake(16,y,180,24)];
-    dl.text=@"延迟(0最快)"; dl.textColor=UIColor.whiteColor; dl.font=[UIFont systemFontOfSize:16];
+    UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 160, 24)];
+    dl.text = @"延迟(0最快)"; dl.textColor = UIColor.whiteColor;
     [self.view addSubview:dl];
-    self.delayLab=[[UILabel alloc] initWithFrame:CGRectMake(W-100,y,84,24)];
-    self.delayLab.autoresizingMask=UIViewAutoresizingFlexibleLeftMargin;
-    self.delayLab.textColor=UIColor.lightGrayColor;
-    self.delayLab.font=[UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium];
-    self.delayLab.textAlignment=NSTextAlignmentRight;
-    [self.view addSubview:self.delayLab]; y+=26;
-    self.delay=[[UISlider alloc] initWithFrame:CGRectMake(16,y,W-32,30)];
-    self.delay.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    self.delay.minimumValue=0; self.delay.maximumValue=1000; self.delay.value=(float)WWRGDelay();
-    [self.delay addTarget:self action:@selector(onDelay:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.delay]; [self refDelay]; y+=36;
+    self.delayLab = [[UILabel alloc] initWithFrame:CGRectMake(W - 90, y, 74, 24)];
+    self.delayLab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    self.delayLab.textColor = UIColor.lightGrayColor;
+    self.delayLab.textAlignment = NSTextAlignmentRight;
+    [self.view addSubview:self.delayLab]; y += 26;
+    self.delay = [[UISlider alloc] initWithFrame:CGRectMake(16, y, W - 32, 30)];
+    self.delay.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.delay.minimumValue = 0; self.delay.maximumValue = 1000; self.delay.value = (float)DelayMs();
+    [self.delay addTarget:self action:@selector(onD:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:self.delay];
+    self.delayLab.text = [NSString stringWithFormat:@"%ldms", (long)self.delay.value]; y += 38;
 
-    self.stats=[[UILabel alloc] initWithFrame:CGRectMake(16,y,W-32,44)];
-    self.stats.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    self.stats.textColor=[UIColor colorWithRed:1 green:0.85 blue:0.2 alpha:1];
-    self.stats.font=[UIFont boldSystemFontOfSize:16]; self.stats.numberOfLines=2;
-    [self.view addSubview:self.stats]; [self refStats]; y+=48;
+    self.stats = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 40)];
+    self.stats.textColor = [UIColor colorWithRed:1 green:0.85 blue:0.2 alpha:1];
+    self.stats.font = [UIFont boldSystemFontOfSize:15]; self.stats.numberOfLines = 2;
+    self.stats.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:self.stats];
+    self.stats.text = [NSString stringWithFormat:@"累计 ¥%@  成功 %ld", Yuan(TotalFen()), (long)GrabCnt()]; y += 48;
 
-    UIButton *rst=[UIButton buttonWithType:UIButtonTypeSystem];
-    rst.frame=CGRectMake(16,y,100,30);
+    UIButton *rst = [UIButton buttonWithType:UIButtonTypeSystem];
+    rst.frame = CGRectMake(16, y, 90, 30);
     [rst setTitle:@"清空统计" forState:UIControlStateNormal];
     [rst setTitleColor:[UIColor colorWithRed:1 green:0.4 blue:0.35 alpha:1] forState:UIControlStateNormal];
     [rst addTarget:self action:@selector(onRst) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:rst]; y+=38;
+    [self.view addSubview:rst]; y += 40;
 
-    self.seg=[[UISegmentedControl alloc] initWithItems:@[@"白名单",@"抢包记录"]];
-    self.seg.frame=CGRectMake(16,y,W-32,32); self.seg.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    self.seg.selectedSegmentIndex=0;
-    [self.seg addTarget:self action:@selector(onSeg) forControlEvents:UIControlEventValueChanged];
-    if (@available(iOS 13.0,*)) self.seg.selectedSegmentTintColor=[UIColor colorWithRed:0.9 green:0.25 blue:0.2 alpha:1];
-    [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName:UIColor.whiteColor} forState:UIControlStateNormal];
-    [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName:UIColor.whiteColor} forState:UIControlStateSelected];
-    [self.view addSubview:self.seg]; y+=42;
+    UILabel *wl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 200, 22)];
+    wl.text = @"白名单(不抢)"; wl.textColor = UIColor.whiteColor;
+    [self.view addSubview:wl]; y += 28;
 
-    self.field=[[UITextField alloc] initWithFrame:CGRectMake(16,y,W-100,36)];
-    self.field.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    self.field.backgroundColor=[UIColor colorWithWhite:0.16 alpha:1];
-    self.field.textColor=UIColor.whiteColor;
-    self.field.attributedPlaceholder=[[NSAttributedString alloc] initWithString:@"会话名包含则不抢" attributes:@{NSForegroundColorAttributeName:UIColor.grayColor}];
-    self.field.layer.cornerRadius=8;
-    self.field.leftView=[[UIView alloc] initWithFrame:CGRectMake(0,0,10,36)];
-    self.field.leftViewMode=UITextFieldViewModeAlways;
-    self.field.returnKeyType=UIReturnKeyDone; self.field.delegate=self;
+    self.field = [[UITextField alloc] initWithFrame:CGRectMake(16, y, W - 100, 36)];
+    self.field.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.field.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
+    self.field.textColor = UIColor.whiteColor;
+    self.field.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"会话名包含" attributes:@{NSForegroundColorAttributeName: UIColor.grayColor}];
+    self.field.layer.cornerRadius = 8;
+    self.field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 36)];
+    self.field.leftViewMode = UITextFieldViewModeAlways;
+    self.field.delegate = self;
     [self.view addSubview:self.field];
-
-    UIButton *add=[UIButton buttonWithType:UIButtonTypeSystem];
-    add.frame=CGRectMake(W-76,y,60,36); add.autoresizingMask=UIViewAutoresizingFlexibleLeftMargin;
+    UIButton *add = [UIButton buttonWithType:UIButtonTypeSystem];
+    add.frame = CGRectMake(W - 76, y, 60, 36); add.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [add setTitle:@"添加" forState:UIControlStateNormal]; [add setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    add.backgroundColor=[UIColor colorWithRed:0.9 green:0.25 blue:0.2 alpha:1]; add.layer.cornerRadius=8;
+    add.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.25 alpha:1]; add.layer.cornerRadius = 8;
     [add addTarget:self action:@selector(onAdd) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:add]; y+=48;
+    [self.view addSubview:add]; y += 48;
 
-    CGFloat th=MAX(120, self.view.bounds.size.height-y-22);
-    self.wlTable=[[UITableView alloc] initWithFrame:CGRectMake(0,y,W,th) style:UITableViewStylePlain];
-    self.wlTable.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
-    self.wlTable.backgroundColor=UIColor.clearColor; self.wlTable.delegate=self; self.wlTable.dataSource=self; self.wlTable.tag=1;
-    [self.view addSubview:self.wlTable];
-    self.hisTable=[[UITableView alloc] initWithFrame:self.wlTable.frame style:UITableViewStylePlain];
-    self.hisTable.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
-    self.hisTable.backgroundColor=UIColor.clearColor; self.hisTable.delegate=self; self.hisTable.dataSource=self; self.hisTable.tag=2;
-    self.hisTable.hidden=YES; [self.view addSubview:self.hisTable];
+    self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, y, W, MAX(100, self.view.bounds.size.height - y - 12)) style:UITableViewStylePlain];
+    self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.table.backgroundColor = UIColor.clearColor;
+    self.table.delegate = self; self.table.dataSource = self;
+    [self.view addSubview:self.table];
 }
-- (void)refDelay { self.delayLab.text=[NSString stringWithFormat:@"%ldms",(long)self.delay.value]; }
-- (void)refStats { self.stats.text=[NSString stringWithFormat:@"累计金额 ¥%@\n成功 %ld 次", WWRGYuan(WWRGFenTotal()), (long)WWRGCnt()]; }
-- (void)refProto {
-    if (gProtoThis) {
-        self.protoLab.text=[NSString stringWithFormat:@"协议层: 已就绪 this=%p\n模式: SendGrab/SendUnWrap 直调", gProtoThis];
-        self.protoLab.textColor=[UIColor colorWithRed:0.3 green:1 blue:0.4 alpha:1];
-    } else {
-        self.protoLab.text=@"协议层: 等待捕获(收到/点开任一红包后激活)\n激活前用无窗 fallback";
-        self.protoLab.textColor=[UIColor colorWithRed:1 green:0.75 blue:0.2 alpha:1];
-    }
+- (void)onEn:(UISwitch *)s { [D() setBool:s.on forKey:kEn]; [D() synchronize]; RefreshBall(); }
+- (void)onD:(UISlider *)s {
+    [D() setInteger:(NSInteger)s.value forKey:kDly]; [D() synchronize];
+    self.delayLab.text = [NSString stringWithFormat:@"%ldms", (long)s.value];
 }
-- (void)viewWillAppear:(BOOL)a { [super viewWillAppear:a]; [self refProto]; [self refStats]; }
-- (void)onEn:(UISwitch *)s { [D() setBool:s.on forKey:kCfgEnabled]; [D() synchronize]; WWRGRefreshBall(); }
-- (void)onDelay:(UISlider *)s { [D() setInteger:(NSInteger)s.value forKey:kCfgDelayMs]; [D() synchronize]; [self refDelay]; }
 - (void)onRst {
-    [D() setInteger:0 forKey:kCfgTotalFen]; [D() setInteger:0 forKey:kCfgGrabCount];
-    [D() setObject:@[] forKey:kCfgHistory]; [D() synchronize];
-    @synchronized(gLock){ [gCounted removeAllObjects]; }
-    self.his=@[]; [self.hisTable reloadData]; [self refStats]; WWRGRefreshBall();
+    [D() setInteger:0 forKey:kFen]; [D() setInteger:0 forKey:kCnt]; [D() setObject:@[] forKey:kHis]; [D() synchronize];
+    @synchronized (gLock) { [gAmtDone removeAllObjects]; }
+    self.stats.text = @"累计 ¥0.00  成功 0"; RefreshBall();
 }
 - (void)onAdd {
-    NSString *t=[self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *t = [self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!t.length) return;
-    if (![self.wl containsObject:t]){ [self.wl addObject:t]; WWRGSetWL(self.wl); [self.wlTable reloadData]; }
-    self.field.text=@""; [self.field resignFirstResponder];
+    if (![self.wl containsObject:t]) { [self.wl addObject:t]; SetWL(self.wl); [self.table reloadData]; }
+    self.field.text = @""; [self.field resignFirstResponder];
 }
-- (void)onSeg {
-    BOOL w=self.seg.selectedSegmentIndex==0;
-    self.wlTable.hidden=!w; self.hisTable.hidden=w; self.field.hidden=!w;
-    if(!w){ self.his=[D() arrayForKey:kCfgHistory]?:@[]; [self.hisTable reloadData]; }
-}
-- (void)close { gPanelWin.hidden=YES; gPanelWin=nil; }
+- (void)close { gPanel.hidden = YES; gPanel = nil; }
 - (BOOL)textFieldShouldReturn:(UITextField *)tf { [self onAdd]; return YES; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return tv.tag==1?self.wl.count:self.his.count; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return self.wl.count; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    UITableViewCell *c=[tv dequeueReusableCellWithIdentifier:@"c"];
-    if(!c){ c=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
-        c.backgroundColor=UIColor.clearColor; c.textLabel.textColor=UIColor.whiteColor;
-        c.detailTextLabel.textColor=UIColor.lightGrayColor; c.selectionStyle=UITableViewCellSelectionStyleNone; }
-    if(tv.tag==1){ c.textLabel.text=self.wl[ip.row]; c.detailTextLabel.text=@"不抢"; }
-    else {
-        NSDictionary *it=self.his[ip.row];
-        c.textLabel.text=[NSString stringWithFormat:@"¥%@  %@", WWRGYuan([it[@"fen"] longLongValue]), it[@"conv"]?:@""];
-        NSDateFormatter *f=[NSDateFormatter new]; f.dateFormat=@"MM-dd HH:mm:ss";
-        c.detailTextLabel.text=[NSString stringWithFormat:@"%@  %@", [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:[it[@"t"] doubleValue]]], it[@"wish"]?:@""];
-    }
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
+    c.backgroundColor = UIColor.clearColor; c.textLabel.textColor = UIColor.whiteColor;
+    c.textLabel.text = self.wl[ip.row]; c.selectionStyle = UITableViewCellSelectionStyleNone;
     return c;
 }
-- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return tv.tag==1; }
+- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return YES; }
 - (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)es forRowAtIndexPath:(NSIndexPath *)ip {
-    if(tv.tag!=1||es!=UITableViewCellEditingStyleDelete) return;
-    [self.wl removeObjectAtIndex:ip.row]; WWRGSetWL(self.wl);
+    if (es != UITableViewCellEditingStyleDelete) return;
+    [self.wl removeObjectAtIndex:ip.row]; SetWL(self.wl);
     [tv deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
 }
 - (NSString *)tableView:(UITableView *)tv titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)ip { return @"删除"; }
-- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return tv.tag==1?46:58; }
 @end
 
-static void WWRGShowPanel(void) {
-    if (gPanelWin){ gPanelWin.hidden=NO; return; }
-    CGRect sb=UIScreen.mainScreen.bounds;
-    CGFloat w=MIN(sb.size.width-20,390), h=MIN(sb.size.height*0.78,660);
-    gPanelWin=[[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width-w)/2,(sb.size.height-h)/2,w,h)];
-    gPanelWin.windowLevel=UIWindowLevelAlert+10;
-    gPanelWin.layer.cornerRadius=14; gPanelWin.clipsToBounds=YES;
-    gPanelWin.rootViewController=[WWRGPanelController new];
-    gPanelWin.hidden=NO;
+static void ShowPanel(void) {
+    if (gPanel) { gPanel.hidden = NO; return; }
+    CGRect sb = UIScreen.mainScreen.bounds;
+    CGFloat w = MIN(sb.size.width - 24, 360), h = MIN(sb.size.height * 0.7, 560);
+    gPanel = [[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width - w) / 2, (sb.size.height - h) / 2, w, h)];
+    gPanel.windowLevel = UIWindowLevelAlert + 10;
+    gPanel.layer.cornerRadius = 12; gPanel.clipsToBounds = YES;
+    gPanel.rootViewController = [WWRGPanel new];
+    gPanel.hidden = NO;
 }
-static void WWRGRefreshBall(void) {
+
+static void RefreshBall(void) {
     if (!gBall) return;
-    BOOL on=WWRGOn();
-    NSString *t = on ? [NSString stringWithFormat:@"¥%@", WWRGYuan(WWRGFenTotal())] : @"关";
-    if (on && gProtoThis) t = [NSString stringWithFormat:@"P\n¥%@", WWRGYuan(WWRGFenTotal())];
-    [gBall setTitle:t forState:UIControlStateNormal];
-    gBall.backgroundColor = on
-        ? (gProtoThis ? [UIColor colorWithRed:0.1 green:0.65 blue:0.25 alpha:0.94]
-                      : [UIColor colorWithRed:0.90 green:0.20 blue:0.18 alpha:0.94])
-        : [UIColor colorWithWhite:0.35 alpha:0.92];
+    BOOL on = On();
+    [gBall setTitle:(on ? [NSString stringWithFormat:@"¥%@", Yuan(TotalFen())] : @"关") forState:UIControlStateNormal];
+    gBall.backgroundColor = on ? [UIColor colorWithRed:0.12 green:0.62 blue:0.28 alpha:0.94]
+                               : [UIColor colorWithWhite:0.35 alpha:0.9];
 }
-static void WWRGDrag(UIPanGestureRecognizer *pan) {
-    UIView *v=pan.view;
-    CGPoint t=[pan translationInView:v.superview];
-    v.center=CGPointMake(v.center.x+t.x, v.center.y+t.y);
+
+static void Drag(UIPanGestureRecognizer *pan) {
+    UIView *v = pan.view;
+    CGPoint t = [pan translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
     [pan setTranslation:CGPointZero inView:v.superview];
-    if(pan.state==UIGestureRecognizerStateEnded){
-        CGRect b=UIScreen.mainScreen.bounds;
-        CGFloat x=v.center.x<b.size.width/2?30:b.size.width-30;
-        CGFloat y=MIN(MAX(v.center.y,80),b.size.height-80);
-        [UIView animateWithDuration:0.18 animations:^{ v.center=CGPointMake(x,y); }];
-        [D() setDouble:x forKey:kCfgBallX]; [D() setDouble:y forKey:kCfgBallY]; [D() synchronize];
+    if (pan.state == UIGestureRecognizerStateEnded) {
+        CGRect b = UIScreen.mainScreen.bounds;
+        CGFloat x = v.center.x < b.size.width / 2 ? 28 : b.size.width - 28;
+        CGFloat y = MIN(MAX(v.center.y, 70), b.size.height - 70);
+        [UIView animateWithDuration:0.15 animations:^{ v.center = CGPointMake(x, y); }];
+        [D() setDouble:x forKey:kBX]; [D() setDouble:y forKey:kBY]; [D() synchronize];
     }
 }
-static void WWRGEnsureUI(void) {
+
+static void EnsureUI(void) {
     if (gUIReady) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gUIReady) return;
-        UIWindow *key=nil;
-        if (@available(iOS 13.0,*)) {
+        UIWindow *key = nil;
+        if (@available(iOS 13.0, *)) {
             for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-                if (sc.activationState!=UISceneActivationStateForegroundActive) continue;
+                if (sc.activationState != UISceneActivationStateForegroundActive) continue;
                 if (![sc isKindOfClass:UIWindowScene.class]) continue;
-                for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow){ key=w; break; }
-                if (!key) key=((UIWindowScene *)sc).windows.firstObject;
+                for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) { key = w; break; }
+                if (!key) key = ((UIWindowScene *)sc).windows.firstObject;
                 if (key) break;
             }
         }
         if (!key) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            key=UIApplication.sharedApplication.keyWindow;
+            key = UIApplication.sharedApplication.keyWindow;
 #pragma clang diagnostic pop
         }
         if (!key) return;
-        CGFloat x=[D() doubleForKey:kCfgBallX], y=[D() doubleForKey:kCfgBallY];
-        if (x<10||y<10){ x=key.bounds.size.width-30; y=key.bounds.size.height*0.55; }
-        gBall=[UIButton buttonWithType:UIButtonTypeCustom];
-        gBall.frame=CGRectMake(0,0,58,58); gBall.center=CGPointMake(x,y);
-        gBall.layer.cornerRadius=29; gBall.clipsToBounds=YES;
-        gBall.titleLabel.font=[UIFont boldSystemFontOfSize:11];
-        gBall.titleLabel.adjustsFontSizeToFitWidth=YES; gBall.titleLabel.numberOfLines=2;
-        gBall.titleLabel.textAlignment=NSTextAlignmentCenter;
+        CGFloat x = [D() doubleForKey:kBX], y = [D() doubleForKey:kBY];
+        if (x < 10 || y < 10) { x = key.bounds.size.width - 28; y = key.bounds.size.height * 0.55; }
+        gBall = [UIButton buttonWithType:UIButtonTypeCustom];
+        gBall.frame = CGRectMake(0, 0, 54, 54); gBall.center = CGPointMake(x, y);
+        gBall.layer.cornerRadius = 27; gBall.clipsToBounds = YES;
+        gBall.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        gBall.titleLabel.adjustsFontSizeToFitWidth = YES; gBall.titleLabel.numberOfLines = 2;
+        gBall.titleLabel.textAlignment = NSTextAlignmentCenter;
         [gBall setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        gBall.layer.borderWidth=1; gBall.layer.borderColor=[UIColor colorWithWhite:1 alpha:0.35].CGColor;
+        gBall.layer.borderWidth = 1; gBall.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.3].CGColor;
 
-        Class cls=NSClassFromString(@"WWRGDragProxy");
+        Class cls = NSClassFromString(@"WWRGBallProxy");
         if (!cls) {
-            cls=objc_allocateClassPair(NSObject.class,"WWRGDragProxy",0);
-            class_addMethod(cls, NSSelectorFromString(@"onPan:"),
-                imp_implementationWithBlock(^(id s, UIPanGestureRecognizer *p){ WWRGDrag(p); }), "v@:@");
-            class_addMethod(cls, NSSelectorFromString(@"onTap"),
-                imp_implementationWithBlock(^(id s){
-                    if (gPanelWin && !gPanelWin.hidden){ gPanelWin.hidden=YES; gPanelWin=nil; }
-                    else WWRGShowPanel();
-                }), "v@:");
+            cls = objc_allocateClassPair(NSObject.class, "WWRGBallProxy", 0);
+            class_addMethod(cls, NSSelectorFromString(@"pan:"),
+                            imp_implementationWithBlock(^(id s, UIPanGestureRecognizer *p) { Drag(p); }), "v@:@");
+            class_addMethod(cls, NSSelectorFromString(@"tap"),
+                            imp_implementationWithBlock(^(id s) {
+                if (gPanel && !gPanel.hidden) { gPanel.hidden = YES; gPanel = nil; }
+                else ShowPanel();
+            }), "v@:");
             objc_registerClassPair(cls);
         }
-        static id proxy; if (!proxy) proxy=[cls new];
-        [gBall addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:proxy action:NSSelectorFromString(@"onPan:")]];
-        [gBall addTarget:proxy action:NSSelectorFromString(@"onTap") forControlEvents:UIControlEventTouchUpInside];
-        [key addSubview:gBall]; WWRGRefreshBall(); gUIReady=YES;
-        WWRGLog(@"悬浮球就绪");
+        static id px; if (!px) px = [cls new];
+        [gBall addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:px action:NSSelectorFromString(@"pan:")]];
+        [gBall addTarget:px action:NSSelectorFromString(@"tap") forControlEvents:UIControlEventTouchUpInside];
+        [key addSubview:gBall]; RefreshBall(); gUIReady = YES;
+        L(@"悬浮球就绪(仅设置,无红包UI)");
     });
 }
 
-#pragma mark - Install ObjC hooks
+#pragma mark - Install hooks
 
-static void WWRGInstallObjC(void) {
-    Class wrap=NSClassFromString(@"WWKConversationWrapper");
+static void Install(void) {
+    gLock = [NSObject new];
+    gDone = [NSMutableSet set];
+    gPending = [NSMutableSet set];
+    gAmtDone = [NSMutableSet set];
+
+    // 1) earliest message
+    Class wrap = NSClassFromString(@"WWKConversationWrapper");
     if (wrap) {
-        SEL o=@selector(OnAddMessage:end:inConversation:);
-        SEL n=NSSelectorFromString(@"wwrg_OnAdd:end:cv:");
-        WWRGHook(wrap,o,n,^(id self,const void *vec,BOOL end,void *cv){
-            ((void(*)(id,SEL,const void*,BOOL,void*))objc_msgSend)(self,n,vec,end,cv);
-            if (WWRGOn()) WWRGOnVec(vec, WWRGName(self));
+        SEL o = @selector(OnAddMessage:end:inConversation:);
+        SEL n = NSSelectorFromString(@"wwrg_add:end:cv:");
+        Hook(wrap, o, n, ^(id self, const void *vec, BOOL end, void *cv) {
+            ((void (*)(id, SEL, const void *, BOOL, void *))objc_msgSend)(self, n, vec, end, cv);
+            if (On()) OnVec(vec, ConvName(self));
         });
     }
-    Class list=NSClassFromString(@"WWKMessageListController");
+    Class list = NSClassFromString(@"WWKMessageListController");
     if (list) {
-        SEL o=@selector(OnAddMessage:end:inConversation:);
-        SEL n=NSSelectorFromString(@"wwrg_listAdd:end:cv:");
-        WWRGHook(list,o,n,^(id self,const void *vec,BOOL end,void *cv){
-            ((void(*)(id,SEL,const void*,BOOL,void*))objc_msgSend)(self,n,vec,end,cv);
-            if (WWRGOn()) WWRGOnVec(vec, @"");
+        SEL o = @selector(OnAddMessage:end:inConversation:);
+        SEL n = NSSelectorFromString(@"wwrg_ladd:end:cv:");
+        Hook(list, o, n, ^(id self, const void *vec, BOOL end, void *cv) {
+            ((void (*)(id, SEL, const void *, BOOL, void *))objc_msgSend)(self, n, vec, end, cv);
+            if (On()) OnVec(vec, @"");
         });
     }
-    Class wmsg=NSClassFromString(@"WWKMessage");
+    Class wmsg = NSClassFromString(@"WWKMessage");
     if (wmsg) {
-        if (class_getInstanceMethod(wmsg,@selector(p_parseHongBaoMessage:))) {
-            SEL n=NSSelectorFromString(@"wwrg_pHB:");
-            WWRGHook(wmsg,@selector(p_parseHongBaoMessage:),n,^(id self,const void *m){
-                ((void(*)(id,SEL,const void*))objc_msgSend)(self,n,m);
-                if (WWRGOn()) WWRGGrabMsg(self, gLastConv?:@"");
+        if (class_getInstanceMethod(wmsg, @selector(p_parseHongBaoMessage:))) {
+            SEL n = NSSelectorFromString(@"wwrg_phb:");
+            Hook(wmsg, @selector(p_parseHongBaoMessage:), n, ^(id self, const void *m) {
+                ((void (*)(id, SEL, const void *))objc_msgSend)(self, n, m);
+                if (On()) FireGrab(self, gLastConv ?: @"");
             });
         }
-        if (class_getInstanceMethod(wmsg,@selector(p_parseLishiHongBaoMessage:))) {
-            SEL n=NSSelectorFromString(@"wwrg_pLishi:");
-            WWRGHook(wmsg,@selector(p_parseLishiHongBaoMessage:),n,^(id self,const void *m){
-                ((void(*)(id,SEL,const void*))objc_msgSend)(self,n,m);
-                if (WWRGOn()) WWRGGrabMsg(self, gLastConv?:@"");
+        if (class_getInstanceMethod(wmsg, @selector(p_parseLishiHongBaoMessage:))) {
+            SEL n = NSSelectorFromString(@"wwrg_plishi:");
+            Hook(wmsg, @selector(p_parseLishiHongBaoMessage:), n, ^(id self, const void *m) {
+                ((void (*)(id, SEL, const void *))objc_msgSend)(self, n, m);
+                if (On()) FireGrab(self, gLastConv ?: @"");
             });
         }
     }
 
-    // NEVER show open window: steal openBlock = protocol unwrap path used by client
-    Class mgr=NSClassFromString(@"WWRedEnvelopesMgr");
+    // 2) KEY: openHongBaoWindow — steal ticket, silent unwrap, NO original UI
+    Class mgr = NSClassFromString(@"WWRedEnvelopesMgr");
     if (mgr) {
-        SEL o2=@selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:);
-        if (class_getInstanceMethod(mgr,o2)) {
-            SEL n=NSSelectorFromString(@"wwrg_oh2:v:tk:vt:c:m:ob:cb:");
-            Method om=class_getInstanceMethod(mgr,o2);
-            IMP imp=imp_implementationWithBlock(^(id self,const void *d,id vids,const void *tk,int vt,void *cv,void *msg,id ob,id cb){
-                if (WWRGOn()) {
-                    // extract ticket if NSString-ish pointer
-                    // fire unwrap block ONLY — no window
-                    WWRGLog(@"拦截开窗 → 只跑 openBlock(协议UnWrap)");
-                    if ([self respondsToSelector:@selector(setOpenBlock:)])
-                        ((void(*)(id,SEL,id))objc_msgSend)(self,@selector(setOpenBlock:),ob);
-                    WWRGInvokeBlock(ob);
-                    // also try direct unwrap if we have this
-                    if (gProtoThis && gLastHid) WWRGProtoUnWrap(gLastHid, gLastTicket);
+        SEL o1 = @selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:);
+        if (class_getInstanceMethod(mgr, o1)) {
+            SEL n = NSSelectorFromString(@"wwrg_ow1:v:tk:vt:c:m:");
+            Method om = class_getInstanceMethod(mgr, o1);
+            IMP imp = imp_implementationWithBlock(^(id self, const void *data, id vids, const void *tk, int vt, void *cv, void *msg) {
+                if (On()) {
+                    NSString *ticket = TicketFromPtr(tk);
+                    L(@"截获 openHB1 ticket=%@ vt=%d — 静默UnWrap 不弹窗", ticket, vt);
+                    if (ticket.length) gLastTicket = ticket;
+                    SilentUnWrap(data, vids, tk, cv);
+                    return; // skip UI
+                }
+                ((void (*)(id, SEL, const void *, id, const void *, int, void *, void *))objc_msgSend)(
+                    self, n, data, vids, tk, vt, cv, msg);
+            });
+            class_addMethod(mgr, n, imp, method_getTypeEncoding(om));
+            Swizzle(mgr, o1, n);
+        }
+
+        SEL o2 = @selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:);
+        if (class_getInstanceMethod(mgr, o2)) {
+            SEL n = NSSelectorFromString(@"wwrg_ow2:v:tk:vt:c:m:ob:cb:");
+            Method om = class_getInstanceMethod(mgr, o2);
+            IMP imp = imp_implementationWithBlock(^(id self, const void *data, id vids, const void *tk, int vt, void *cv, void *msg, id ob, id cb) {
+                if (On()) {
+                    NSString *ticket = TicketFromPtr(tk);
+                    L(@"截获 openHB2 ticket=%@ ob=%@ — 静默UnWrap", ticket, ob);
+                    if (ticket.length) gLastTicket = ticket;
+                    // openBlock often NULL; still SilentUnWrap
+                    if (ob) {
+                        // try block first if present (protocol path)
+                        @try {
+                            void (^b)(void) = ob;
+                            b();
+                            L(@"openBlock 已调");
+                        } @catch (__unused NSException *e) {
+                            SilentUnWrap(data, vids, tk, cv);
+                        }
+                    } else {
+                        SilentUnWrap(data, vids, tk, cv);
+                    }
                     return;
                 }
-                ((void(*)(id,SEL,const void*,id,const void*,int,void*,void*,id,id))objc_msgSend)(
-                    self,n,d,vids,tk,vt,cv,msg,ob,cb);
+                ((void (*)(id, SEL, const void *, id, const void *, int, void *, void *, id, id))objc_msgSend)(
+                    self, n, data, vids, tk, vt, cv, msg, ob, cb);
             });
-            class_addMethod(mgr,n,imp,method_getTypeEncoding(om));
-            WWRGSwizzle(mgr,o2,n);
+            class_addMethod(mgr, n, imp, method_getTypeEncoding(om));
+            Swizzle(mgr, o2, n);
         }
-        SEL o1=@selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:);
-        if (class_getInstanceMethod(mgr,o1)) {
-            SEL n=NSSelectorFromString(@"wwrg_oh1:v:tk:vt:c:m:");
-            Method om=class_getInstanceMethod(mgr,o1);
-            IMP imp=imp_implementationWithBlock(^(id self,const void *d,id vids,const void *tk,int vt,void *cv,void *msg){
-                if (WWRGOn()) {
-                    id ob=WWRGCall(self,@selector(openBlock));
-                    if (ob) { WWRGLog(@"oh1 openBlock"); WWRGInvokeBlock(ob); return; }
-                    if (gProtoThis && gLastHid) { WWRGProtoUnWrap(gLastHid,gLastTicket); return; }
-                }
-                ((void(*)(id,SEL,const void*,id,const void*,int,void*,void*))objc_msgSend)(
-                    self,n,d,vids,tk,vt,cv,msg);
-                if (WWRGOn()) {
-                    id ob=WWRGCall(self,@selector(openBlock));
-                    if (ob) WWRGInvokeBlock(ob);
-                    WWRGCallV(self,@selector(closeHongBaoWindow));
-                    id win=nil; Ivar iv=class_getInstanceVariable([self class],"_mHongBaoWindow");
-                    if (iv) win=object_getIvar(self,iv);
-                    WWRGNuke(win);
-                }
-            });
-            class_addMethod(mgr,n,imp,method_getTypeEncoding(om));
-            WWRGSwizzle(mgr,o1,n);
-        }
-        if (class_getInstanceMethod(mgr,@selector(didOpenRedEvnSuc:))) {
-            SEL n=NSSelectorFromString(@"wwrg_didOpen:");
-            WWRGHook(mgr,@selector(didOpenRedEvnSuc:),n,^(id self,id arg){
-                ((void(*)(id,SEL,id))objc_msgSend)(self,n,arg);
-                long long fen=WWRGFenFrom(arg);
-                WWRGLog(@"didOpenSuc fen=%lld", fen);
-                WWRGBook(gLastConv,gLastHid,fen,gLastWish);
-                WWRGCallV(self,@selector(closeHongBaoWindow));
-                WWRGCallV(self,@selector(closeResultWindow));
+
+        if (class_getInstanceMethod(mgr, @selector(didOpenRedEvnSuc:))) {
+            SEL n = NSSelectorFromString(@"wwrg_ok:");
+            Hook(mgr, @selector(didOpenRedEvnSuc:), n, ^(id self, id arg) {
+                ((void (*)(id, SEL, id))objc_msgSend)(self, n, arg);
+                L(@"didOpenRedEvnSuc %@", arg);
+                // amount usually already booked via setMSelfRecvAmount
+                CallV(self, @selector(closeHongBaoWindow));
+                CallV(self, @selector(closeResultWindow));
             });
         }
     }
 
-    Class openWin=NSClassFromString(@"WWRedEnvOpenHongBaoWindow");
-    if (openWin) {
-        if (class_getInstanceMethod(openWin,@selector(didMoveToWindow))) {
-            SEL n=NSSelectorFromString(@"wwrg_owMove");
-            WWRGHook(openWin,@selector(didMoveToWindow),n,^(id self){
-                ((void(*)(id,SEL))objc_msgSend)(self,n);
-                if (!WWRGOn()) return;
-                WWRGNuke(self);
-                id mgrInst=WWRGCall(NSClassFromString(@"WWRedEnvelopesMgr"),@selector(shareInstance));
-                id ob=WWRGCall(mgrInst,@selector(openBlock));
-                if (ob) WWRGInvokeBlock(ob);
-                else if ([self respondsToSelector:@selector(onOpenBtnClick:)])
-                    ((void(*)(id,SEL,id))objc_msgSend)(self,@selector(onOpenBtnClick:),nil);
-                WWRGCallV(mgrInst,@selector(closeHongBaoWindow));
+    // 3) if any window still appears, nuke + force open
+    Class win = NSClassFromString(@"WWRedEnvOpenHongBaoWindow");
+    if (win) {
+        if (class_getInstanceMethod(win, @selector(didMoveToWindow))) {
+            SEL n = NSSelectorFromString(@"wwrg_mv");
+            Hook(win, @selector(didMoveToWindow), n, ^(id self) {
+                ((void (*)(id, SEL))objc_msgSend)(self, n);
+                if (!On()) return;
+                if ([self isKindOfClass:UIView.class]) NukeView((UIView *)self);
+                NSNumber *sil = objc_getAssociatedObject(self, "wwrg_silent");
+                if (sil.boolValue) return; // our silent win already clicking
+                // foreign window — steal click
+                if ([self respondsToSelector:@selector(onOpenBtnClick:)])
+                    ((void (*)(id, SEL, id))objc_msgSend)(self, @selector(onOpenBtnClick:), nil);
+                id mgr = Call(NSClassFromString(@"WWRedEnvelopesMgr"), @selector(shareInstance));
+                CallV(mgr, @selector(closeHongBaoWindow));
             });
         }
-        if (class_getInstanceMethod(openWin,@selector(layoutSubviews))) {
-            SEL n=NSSelectorFromString(@"wwrg_owLay");
-            WWRGHook(openWin,@selector(layoutSubviews),n,^(id self){
-                ((void(*)(id,SEL))objc_msgSend)(self,n);
-                if (WWRGOn()) WWRGNuke(self);
+        if (class_getInstanceMethod(win, @selector(layoutSubviews))) {
+            SEL n = NSSelectorFromString(@"wwrg_lay");
+            Hook(win, @selector(layoutSubviews), n, ^(id self) {
+                ((void (*)(id, SEL))objc_msgSend)(self, n);
+                if (On() && [self isKindOfClass:UIView.class]) NukeView((UIView *)self);
             });
         }
     }
 
-    Class res=NSClassFromString(@"WWRedEnvOpenResultWindow");
-    if (res && class_getInstanceMethod(res,@selector(_updateUIData:))) {
-        SEL n=NSSelectorFromString(@"wwrg_res:");
-        WWRGHook(res,@selector(_updateUIData:),n,^(id self,BOOL f){
-            ((void(*)(id,SEL,BOOL))objc_msgSend)(self,n,f);
-            if (!WWRGOn()) return;
-            WWRGNuke(self);
-            long long fen=WWRGFenFrom(self);
-            NSString *hid=nil; id h=WWRGCall(self,@selector(mHongBaoID));
-            if ([h isKindOfClass:NSString.class]) hid=h;
-            WWRGBook(gLastConv, hid?:gLastHid, fen, gLastWish);
-            WWRGCallV(self,@selector(_closeRedEnvWindow));
+    // 4) amount
+    Class detail = NSClassFromString(@"WWRedEnvDetailViewController");
+    if (detail && class_getInstanceMethod(detail, @selector(setMSelfRecvAmount:))) {
+        SEL n = NSSelectorFromString(@"wwrg_amt:");
+        Hook(detail, @selector(setMSelfRecvAmount:), n, ^(id self, unsigned long long fen) {
+            ((void (*)(id, SEL, unsigned long long))objc_msgSend)(self, n, fen);
+            if (!On()) return;
+            L(@"金额 %llu 分", fen);
+            NSString *hid = nil;
+            id h = Call(self, @selector(mHongBaoID));
+            if ([h isKindOfClass:NSString.class]) hid = h;
+            Book(gLastConv, hid ?: gLastHid, (long long)fen, gLastWish);
+            // dismiss detail
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    UIViewController *vc = (UIViewController *)self;
+                    if ([vc isKindOfClass:UIViewController.class]) {
+                        NukeView(vc.view);
+                        if (vc.presentingViewController) [vc dismissViewControllerAnimated:NO completion:nil];
+                        else if (vc.navigationController.topViewController == vc)
+                            [vc.navigationController popViewControllerAnimated:NO];
+                    }
+                } @catch (__unused NSException *e) {}
+            });
         });
     }
-
-    Class detail=NSClassFromString(@"WWRedEnvDetailViewController");
-    if (detail) {
-        if (class_getInstanceMethod(detail,@selector(setMSelfRecvAmount:))) {
-            SEL n=NSSelectorFromString(@"wwrg_selfAmt:");
-            WWRGHook(detail,@selector(setMSelfRecvAmount:),n,^(id self,unsigned long long amt){
-                ((void(*)(id,SEL,unsigned long long))objc_msgSend)(self,n,amt);
-                if (!WWRGOn()) return;
-                WWRGLog(@"自己金额=%llu分", amt);
-                if (amt>0) {
-                    NSString *hid=nil; id h=WWRGCall(self,@selector(mHongBaoID));
-                    if ([h isKindOfClass:NSString.class]) hid=h;
-                    WWRGBook(gLastConv, hid?:gLastHid, (long long)amt, gLastWish);
-                }
-                WWRGNukeVC(self);
-            });
-        }
-        if (class_getInstanceMethod(detail,@selector(viewWillAppear:))) {
-            SEL n=NSSelectorFromString(@"wwrg_dWill:");
-            WWRGHook(detail,@selector(viewWillAppear:),n,^(id self,BOOL a){
-                if (WWRGOn()){ UIView *v=[self view]; v.hidden=YES; v.alpha=0; }
-                ((void(*)(id,SEL,BOOL))objc_msgSend)(self,n,a);
-                if (WWRGOn()) WWRGNukeVC(self);
-            });
-        }
-    }
-
-    Class header=NSClassFromString(@"WWRedEnvDetailHeaderCellView");
-    SEL hset=@selector(setContent:tipsWording:summaryWording:hongbaoType:hongbaoSubType:hongbaoId:amount:wishingWording:showTurnIn:clickTurnIn:);
-    if (header && class_getInstanceMethod(header,hset)) {
-        SEL n=NSSelectorFromString(@"wwrg_hdr:::::::::");
-        Method om=class_getInstanceMethod(header,hset);
-        IMP imp=imp_implementationWithBlock(^(id self,unsigned long long content,id tips,id sum,unsigned int ty,unsigned int sub,id hid,unsigned long long amount,id wish,BOOL show,id clk){
-            ((void(*)(id,SEL,unsigned long long,id,id,unsigned int,unsigned int,id,unsigned long long,id,BOOL,id))objc_msgSend)(
-                self,n,content,tips,sum,ty,sub,hid,amount,wish,show,clk);
-            if (WWRGOn() && amount>0) {
-                WWRGBook(gLastConv, [hid isKindOfClass:NSString.class]?hid:gLastHid,
-                         (long long)amount, [wish isKindOfClass:NSString.class]?wish:gLastWish);
+    if (detail && class_getInstanceMethod(detail, @selector(viewWillAppear:))) {
+        SEL n = NSSelectorFromString(@"wwrg_dwa:");
+        Hook(detail, @selector(viewWillAppear:), n, ^(id self, BOOL a) {
+            if (On()) {
+                UIView *v = [(UIViewController *)self view];
+                v.hidden = YES; v.alpha = 0;
             }
-        });
-        class_addMethod(header,n,imp,method_getTypeEncoding(om));
-        WWRGSwizzle(header,hset,n);
-    }
-
-    Class bubble=NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
-    if (bubble && class_getInstanceMethod(bubble,@selector(updateData))) {
-        SEL n=NSSelectorFromString(@"wwrg_bUpd");
-        WWRGHook(bubble,@selector(updateData),n,^(id self){
-            ((void(*)(id,SEL))objc_msgSend)(self,n);
-            if (!WWRGOn()) return;
-            id msg=WWRGCall(self,@selector(message));
-            if (msg) WWRGGrabMsg(msg,@"");
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, n, a);
         });
     }
 
-    WWRGLog(@"ObjC hooks 完成");
+    Class res = NSClassFromString(@"WWRedEnvOpenResultWindow");
+    if (res && class_getInstanceMethod(res, @selector(_updateUIData:))) {
+        SEL n = NSSelectorFromString(@"wwrg_rui:");
+        Hook(res, @selector(_updateUIData:), n, ^(id self, BOOL f) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, n, f);
+            if (!On()) return;
+            if ([self isKindOfClass:UIView.class]) NukeView((UIView *)self);
+            unsigned long long amt = CallQ(self, @selector(mTotalAmount));
+            if (amt > 0) {
+                NSString *hid = Call(self, @selector(mHongBaoID));
+                Book(gLastConv, [hid isKindOfClass:NSString.class] ? hid : gLastHid, (long long)amt, gLastWish);
+            }
+            CallV(self, @selector(_closeRedEnvWindow));
+        });
+    }
+
+    // in-chat bubble backup (if already viewing chat when HB arrives rendered)
+    Class bubble = NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
+    if (bubble && class_getInstanceMethod(bubble, @selector(updateData))) {
+        SEL n = NSSelectorFromString(@"wwrg_bupd");
+        Hook(bubble, @selector(updateData), n, ^(id self) {
+            ((void (*)(id, SEL))objc_msgSend)(self, n);
+            if (!On()) return;
+            id msg = Call(self, @selector(message));
+            if (msg) FireGrab(msg, @"");
+        });
+    }
+
+    L(@"安装完成 纯协议静默抢 enabled=%d delay=%ld", On(), (long)DelayMs());
 }
 
-#pragma mark - ctor
-
 __attribute__((constructor))
-static void WWRGInit(void) {
+static void Init(void) {
     @autoreleasepool {
-        gLock=[NSObject new];
-        gDone=[NSMutableSet set];
-        gPending=[NSMutableSet set];
-        gCounted=[NSMutableSet set];
-        WWRGLog(@"加载 bundle=%@", NSBundle.mainBundle.bundleIdentifier);
-
-        // C hooks ASAP
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            // small delay so dyld finishes
-            usleep(300 * 1000);
-            BOOL ok=WWRGInstallCHooks();
-            WWRGLog(@"C hook %s", ok?"OK":"FAIL");
+        L(@"load %@", NSBundle.mainBundle.bundleIdentifier);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            Install();
         });
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!gHooked) WWRGInstallCHooks();
-            WWRGInstallObjC();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            EnsureUI();
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            WWRGEnsureUI();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!gUIReady) WWRGEnsureUI();
-            WWRGRefreshBall();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!gUIReady) EnsureUI();
         });
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
                                                         object:nil queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(__unused NSNotification *n){
-            if (!gUIReady) WWRGEnsureUI();
-            else if (gBall && !gBall.superview){ gUIReady=NO; WWRGEnsureUI(); }
-            WWRGRefreshBall();
+                                                    usingBlock:^(__unused NSNotification *n) {
+            if (!gUIReady) EnsureUI();
+            else if (gBall && !gBall.superview) { gUIReady = NO; EnsureUI(); }
         }];
     }
 }
