@@ -3,25 +3,20 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-/*
- * WWRedGrab v3 — safe silent grab
- *
- * Manual open MUST work. So:
- *  - Default: almost no UI interference
- *  - Only when gArmedHid is set by our receive path do we auto-press open
- *  - NEVER skip original openHongBaoWindow
- *  - NEVER hide/nuke window on manual opens
- *  - NO updateData / parse hooks
+/* WWRedGrab v4
+ * NEVER hook openHongBaoWindow (scoped_refptr ABI breaks manual open).
+ * Only OnAddMessage(end==YES) + setMSelfRecvAmount (our hids only).
+ * Auto: delay -> tony_onClick -> poll ActiveWin -> onOpenBtnClick.
  */
 
-static NSString * const kEn  = @"wwrg_enabled";
+static NSString * const kEn = @"wwrg_enabled";
 static NSString * const kDly = @"wwrg_delay_ms";
-static NSString * const kWL  = @"wwrg_whitelist";
+static NSString * const kWL = @"wwrg_whitelist";
 static NSString * const kFen = @"wwrg_total_fen";
 static NSString * const kCnt = @"wwrg_grab_count";
 static NSString * const kHis = @"wwrg_history";
-static NSString * const kBX  = @"wwrg_ball_x";
-static NSString * const kBY  = @"wwrg_ball_y";
+static NSString * const kBX = @"wwrg_ball_x";
+static NSString * const kBY = @"wwrg_ball_y";
 
 static UIButton *gBall;
 static UIWindow *gPanel;
@@ -30,12 +25,12 @@ static NSObject *gLock;
 static NSMutableSet *gDone;
 static NSMutableSet *gPending;
 static NSMutableSet *gAmtDone;
-
 static NSString *gLastHid;
 static NSString *gLastConv;
 static NSString *gLastWish;
-static NSString *gArmedHid;   // non-nil => next open window is ours, auto open
+static NSString *gArmedHid;
 static NSInteger gArmGen;
+static BOOL gClicking;
 
 static void L(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void L(NSString *fmt, ...) {
@@ -43,7 +38,6 @@ static void L(NSString *fmt, ...) {
     NSLog(@"[WWRedGrab] %@", [[NSString alloc] initWithFormat:fmt arguments:ap]);
     va_end(ap);
 }
-
 static NSUserDefaults *UD(void) { return NSUserDefaults.standardUserDefaults; }
 static BOOL On(void) {
     if (![UD() objectForKey:kEn]) return YES;
@@ -51,7 +45,7 @@ static BOOL On(void) {
 }
 static NSInteger DelayMs(void) {
     NSInteger v = [UD() integerForKey:kDly];
-    if (v < 100) v = 100; // safer default min
+    if (v < 150) v = 150;
     if (v > 3000) v = 3000;
     return v;
 }
@@ -60,7 +54,6 @@ static void SetWL(NSArray *a) { [UD() setObject:a ?: @[] forKey:kWL]; [UD() sync
 static long long TotalFen(void) { return (long long)[UD() integerForKey:kFen]; }
 static NSInteger GrabCnt(void) { return [UD() integerForKey:kCnt]; }
 static NSString *Yuan(long long f) { return [NSString stringWithFormat:@"%.2f", f / 100.0]; }
-
 static BOOL IsWL(NSString *name) {
     if (!name.length) return NO;
     NSString *n = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -70,7 +63,6 @@ static BOOL IsWL(NSString *name) {
     }
     return NO;
 }
-
 static BOOL Begin(NSString *hid) {
     if (!hid.length) return NO;
     @synchronized (gLock) {
@@ -81,16 +73,24 @@ static BOOL Begin(NSString *hid) {
 }
 static void End(NSString *hid) {
     if (!hid.length) return;
-    @synchronized (gLock) {
-        [gPending removeObject:hid];
-        [gDone addObject:hid];
-    }
+    @synchronized (gLock) { [gPending removeObject:hid]; [gDone addObject:hid]; }
 }
 static void Cancel(NSString *hid) {
     if (!hid.length) return;
     @synchronized (gLock) { [gPending removeObject:hid]; }
 }
-
+static void ClearArmIf(NSString *hid) {
+    @synchronized (gLock) {
+        if (hid.length && [gArmedHid isEqualToString:hid]) gArmedHid = nil;
+    }
+}
+static void Arm(NSString *hid) {
+    @synchronized (gLock) { gArmedHid = [hid copy]; gArmGen++; }
+    NSInteger gen = gArmGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @synchronized (gLock) { if (gArmGen == gen) gArmedHid = nil; }
+    });
+}
 static id Call(id o, SEL s) {
     if (!o || !s || ![o respondsToSelector:s]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(o, s);
@@ -99,13 +99,7 @@ static void CallV(id o, SEL s) {
     if (!o || !s || ![o respondsToSelector:s]) return;
     ((void (*)(id, SEL))objc_msgSend)(o, s);
 }
-static unsigned long long CallQ(id o, SEL s) {
-    if (!o || !s || ![o respondsToSelector:s]) return 0;
-    return ((unsigned long long (*)(id, SEL))objc_msgSend)(o, s);
-}
-
 static void RefreshBall(void);
-
 static void Book(NSString *conv, NSString *hid, long long fen, NSString *wish) {
     if (hid.length) {
         @synchronized (gLock) {
@@ -128,10 +122,9 @@ static void Book(NSString *conv, NSString *hid, long long fen, NSString *wish) {
     if (fen > 0) [UD() setInteger:(NSInteger)(TotalFen() + fen) forKey:kFen];
     [UD() setInteger:GrabCnt() + 1 forKey:kCnt];
     [UD() synchronize];
-    L(@"入账 ¥%@ (%lld分) hid=%@", Yuan(fen), fen, hid);
+    L(@"book Y%@ fen=%lld hid=%@", Yuan(fen), fen, hid);
     dispatch_async(dispatch_get_main_queue(), ^{ RefreshBall(); });
 }
-
 static void Swizzle(Class c, SEL o, SEL n) {
     if (!c) return;
     Method om = class_getInstanceMethod(c, o);
@@ -148,27 +141,9 @@ static void Hook(Class c, SEL o, SEL n, id block) {
     class_addMethod(c, n, imp_implementationWithBlock(block), method_getTypeEncoding(om));
     Swizzle(c, o, n);
 }
-
-static NSString *TicketFromPtr(const void *p) {
-    if (!p) return nil;
-    @try {
-        id o = (__bridge id)p;
-        if ([o isKindOfClass:NSString.class] && [(NSString *)o length] > 8) return (NSString *)o;
-    } @catch (__unused NSException *e) {}
-    @try {
-        const char *s = *(const char * const *)p;
-        if (s && s[0]) {
-            NSString *t = [NSString stringWithUTF8String:s];
-            if (t.length > 8 && t.length < 200) return t;
-        }
-    } @catch (__unused NSException *e) {}
-    return nil;
-}
-
 static id Mgr(void) {
     return Call(NSClassFromString(@"WWRedEnvelopesMgr"), @selector(shareInstance));
 }
-
 static id ActiveWin(void) {
     id mgr = Mgr();
     id win = Call(mgr, @selector(currentActiveHongbaoWindow));
@@ -179,52 +154,38 @@ static id ActiveWin(void) {
     } @catch (__unused NSException *e) {}
     return nil;
 }
-
-// Only for OUR armed grabs. Manual opens never arm => never auto click / hide.
-static void TryAutoOpenIfArmed(void) {
-    if (!On()) return;
-    NSString *armed = nil;
-    @synchronized (gLock) { armed = [gArmedHid copy]; }
-    if (!armed.length) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *still = nil;
-        @synchronized (gLock) { still = [gArmedHid copy]; }
-        if (!still.length) return;
-
-        id win = ActiveWin();
-        if (!win) {
-            L(@"armed but no window yet hid=%@", still);
-            return;
-        }
-
-        L(@"自动拆包 hid=%@ win=%@", still, win);
-        // hide only our automated window
-        if ([win isKindOfClass:UIView.class]) {
-            UIView *v = (UIView *)win;
-            v.alpha = 0.01; // not full nuke — less layout breakage
-            v.userInteractionEnabled = NO;
-        }
-
-        @try {
-            if ([win respondsToSelector:@selector(onOpenBtnClick:)])
-                ((void (*)(id, SEL, id))objc_msgSend)(win, @selector(onOpenBtnClick:), nil);
-        } @catch (NSException *ex) {
-            L(@"onOpenBtnClick ex %@", ex);
-        }
-
-        @synchronized (gLock) {
-            if ([gArmedHid isEqualToString:still]) gArmedHid = nil;
-        }
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            id mgr = Mgr();
-            CallV(mgr, @selector(closeHongBaoWindow));
-            CallV(mgr, @selector(closeResultWindow));
+static void PollAndOpen(NSString *hid) {
+    if (!On() || !hid.length) return;
+    for (int i = 0; i < 15; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + 0.12 * i) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (gClicking) return;
+            NSString *armed = nil;
+            @synchronized (gLock) { armed = [gArmedHid copy]; }
+            if (![armed isEqualToString:hid]) return;
+            id win = ActiveWin();
+            if (!win) return;
+            gClicking = YES;
+            L(@"poll win auto-open hid=%@", hid);
+            if ([win isKindOfClass:UIView.class]) {
+                ((UIView *)win).alpha = 0.01;
+                ((UIView *)win).userInteractionEnabled = NO;
+            }
+            @try {
+                if ([win respondsToSelector:@selector(onOpenBtnClick:)])
+                    ((void (*)(id, SEL, id))objc_msgSend)(win, @selector(onOpenBtnClick:), nil);
+            } @catch (NSException *ex) {
+                L(@"open ex %@", ex);
+            }
+            ClearArmIf(hid);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                id mgr = Mgr();
+                CallV(mgr, @selector(closeHongBaoWindow));
+                CallV(mgr, @selector(closeResultWindow));
+                gClicking = NO;
+            });
         });
-    });
+    }
 }
-
 static BOOL IsHB(id item) {
     if (!item) return NO;
     NSString *cn = NSStringFromClass([item class]);
@@ -242,93 +203,54 @@ static NSString *WishOf(id item) {
     w = Call(item, @selector(lishingWording));
     return [w isKindOfClass:NSString.class] ? w : @"";
 }
-
-static void Arm(NSString *hid) {
-    @synchronized (gLock) {
-        gArmedHid = [hid copy];
-        gArmGen++;
-    }
-    // auto clear arm after 8s to never poison manual opens
-    NSInteger gen = gArmGen;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @synchronized (gLock) {
-            if (gArmGen == gen) gArmedHid = nil;
-        }
-    });
-}
-
 static void FireGrab(id msg, NSString *conv) {
     if (!On() || !msg) return;
-    if (IsWL(conv)) { L(@"白名单 %@", conv); return; }
-
+    if (IsWL(conv)) return;
     id item = Call(msg, @selector(messageItem));
     if (!IsHB(item)) {
         NSArray *items = Call(msg, @selector(messageItems));
-        if ([items isKindOfClass:NSArray.class]) {
-            for (id it in items) {
-                if (IsHB(it)) { item = it; break; }
-            }
-        }
+        if ([items isKindOfClass:NSArray.class])
+            for (id it in items) if (IsHB(it)) { item = it; break; }
     }
     if (!IsHB(item)) return;
-
     NSString *hid = HidOf(item);
     if (!hid.length) return;
     if (!Begin(hid)) return;
-
     gLastHid = [hid copy];
     gLastConv = [conv ?: @"" copy];
     gLastWish = [WishOf(item) ?: @"" copy];
     Arm(hid);
-    L(@"发现红包 hid=%@ conv=%@", hid, conv);
-
+    L(@"found HB hid=%@ conv=%@", hid, conv);
     NSInteger dly = DelayMs();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dly * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         @try {
             Class bcls = NSClassFromString(@"WWKConversationRedEnvelopesBubbleView");
-            if (!bcls) { Cancel(hid); return; }
+            if (!bcls) { Cancel(hid); ClearArmIf(hid); return; }
             id bubble = [[bcls alloc] init];
-            // Prefer setMessage: only — withItemIndex: may need style internals
             if ([bubble respondsToSelector:@selector(setMessage:)])
                 ((void (*)(id, SEL, id))objc_msgSend)(bubble, @selector(setMessage:), msg);
             else if ([bubble respondsToSelector:@selector(setMessage:withItemIndex:)])
                 ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(bubble, @selector(setMessage:withItemIndex:), msg, 0);
-
-            // Do NOT call updateData here — can re-enter UI layout while list is updating
-
             if ([bubble respondsToSelector:@selector(tony_onClickHongbaoMessage)]) {
                 CallV(bubble, @selector(tony_onClickHongbaoMessage));
-                L(@"Grab tony_onClick hid=%@", hid);
+                L(@"tony_onClick hid=%@", hid);
             } else if ([bubble respondsToSelector:@selector(onClickHongbaoMessage)]) {
                 CallV(bubble, @selector(onClickHongbaoMessage));
-                L(@"Grab onClick hid=%@", hid);
+                L(@"onClick hid=%@", hid);
             } else {
-                Cancel(hid);
-                @synchronized (gLock) { if ([gArmedHid isEqualToString:hid]) gArmedHid = nil; }
-                return;
+                Cancel(hid); ClearArmIf(hid); return;
             }
-
             objc_setAssociatedObject(msg, "wwrg_b", bubble, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 objc_setAssociatedObject(msg, "wwrg_b", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             });
-
-            // fallback auto-open poll a few times in case openHB hook order differs
-            for (int i = 1; i <= 6; i++) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 * i) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    NSString *a = nil;
-                    @synchronized (gLock) { a = [gArmedHid copy]; }
-                    if ([a isEqualToString:hid]) TryAutoOpenIfArmed();
-                });
-            }
+            PollAndOpen(hid);
         } @catch (NSException *ex) {
             L(@"FireGrab ex %@", ex);
-            Cancel(hid);
-            @synchronized (gLock) { if ([gArmedHid isEqualToString:hid]) gArmedHid = nil; }
+            Cancel(hid); ClearArmIf(hid);
         }
     });
 }
-
 static id WrapMsg(void *p) {
     if (!p) return nil;
     Class c = NSClassFromString(@"WWKMessage");
@@ -343,48 +265,43 @@ static id WrapMsg(void *p) {
     } @catch (__unused NSException *e) {}
     return nil;
 }
-
 typedef struct { void **begin; void **end; void **cap; } Vec;
-
-static void OnVec(const void *vec, NSString *conv) {
+static void HandleVecSync(const void *vec, NSString *conv) {
     if (!vec || !On()) return;
-    // fully detach from caller
-    const void *vecCopy = vec; // pointer only; vector owned by caller — process ASAP async
-    NSString *c = [conv copy] ?: @"";
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        @try {
-            // snapshot pointers quickly
-            NSMutableArray *ptrs = [NSMutableArray array];
-            const Vec *v = (const Vec *)vecCopy;
-            if (v->begin && v->end && v->end > v->begin) {
-                ptrdiff_t n = v->end - v->begin;
-                if (n > 0 && n <= 20) {
-                    for (ptrdiff_t i = 0; i < n; i++) {
-                        void *p = v->begin[i];
-                        if (p) [ptrs addObject:[NSValue valueWithPointer:p]];
-                    }
+    NSMutableArray *msgs = [NSMutableArray array];
+    @try {
+        const Vec *v = (const Vec *)vec;
+        if (v->begin && v->end && v->end > v->begin) {
+            ptrdiff_t n = v->end - v->begin;
+            if (n > 0 && n <= 15) {
+                for (ptrdiff_t i = 0; i < n; i++) {
+                    void *p = v->begin[i];
+                    if (!p) continue;
+                    id msg = WrapMsg(p);
+                    if (msg) [msgs addObject:msg];
                 }
-            } else {
-                void *one = *(void * const *)vecCopy;
-                if (one) [ptrs addObject:[NSValue valueWithPointer:one]];
             }
-            for (NSValue *val in ptrs) {
-                void *p = val.pointerValue;
-                id msg = WrapMsg(p);
-                if (msg) FireGrab(msg, c);
+        } else {
+            void *one = *(void * const *)vec;
+            if (one) {
+                id msg = WrapMsg(one);
+                if (msg) [msgs addObject:msg];
             }
-        } @catch (NSException *ex) {
-            L(@"OnVec ex %@", ex);
         }
+    } @catch (NSException *ex) {
+        L(@"wrap ex %@", ex);
+        return;
+    }
+    if (!msgs.count) return;
+    NSString *c = [conv copy] ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (id msg in msgs) FireGrab(msg, c);
     });
 }
-
 static NSString *CName(id w) {
     id n = Call(w, @selector(getName));
     return [n isKindOfClass:NSString.class] ? n : @"";
 }
-
-#pragma mark - UI settings ball
 
 @interface WWRGPanel : UIViewController <UITableViewDelegate, UITableViewDataSource, UITextFieldDelegate>
 @property (nonatomic, strong) UISwitch *en;
@@ -402,91 +319,104 @@ static NSString *CName(id w) {
     self.wl = [WL() mutableCopy] ?: [NSMutableArray array];
     CGFloat W = self.view.bounds.size.width, y = 50;
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, W - 90, 28)];
-    t.text = @"秒抢 v3"; t.textColor = UIColor.whiteColor; t.font = [UIFont boldSystemFontOfSize:17];
-    t.autoresizingMask = UIViewAutoresizingFlexibleWidth; [self.view addSubview:t];
+    t.text = @"HB Grab v4"; t.textColor = UIColor.whiteColor;
+    t.font = [UIFont boldSystemFontOfSize:17];
+    t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:t];
     UIButton *c = [UIButton buttonWithType:UIButtonTypeSystem];
-    c.frame = CGRectMake(W - 70, 12, 54, 32); c.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [c setTitle:@"关闭" forState:UIControlStateNormal]; [c setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [c addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside]; [self.view addSubview:c];
-
+    c.frame = CGRectMake(W - 70, 12, 54, 32);
+    c.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [c setTitle:@"Close" forState:UIControlStateNormal];
+    [c setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [c addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:c];
     UILabel *el = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 120, 28)];
-    el.text = @"自动抢"; el.textColor = UIColor.whiteColor; [self.view addSubview:el];
+    el.text = @"Auto"; el.textColor = UIColor.whiteColor; [self.view addSubview:el];
     self.en = [[UISwitch alloc] initWithFrame:CGRectMake(W - 70, y, 51, 31)];
-    self.en.on = On(); self.en.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    self.en.on = On();
+    self.en.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [self.en addTarget:self action:@selector(onEn:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.en]; y += 44;
-
-    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 40)];
-    tip.numberOfLines = 2; tip.font = [UIFont systemFontOfSize:12];
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 50)];
+    tip.numberOfLines = 3; tip.font = [UIFont systemFontOfSize:12];
     tip.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.5 alpha:1];
-    tip.text = @"手动点红包=不干预\n自动抢=仅武装后的开窗才静默拆";
-    [self.view addSubview:tip]; y += 46;
-
-    UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 180, 24)];
-    dl.text = @"延迟ms(建议200+)"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
+    tip.text = @"v4: no openHB hook\nmanual open should work\nauto = recv Grab + poll open";
+    [self.view addSubview:tip]; y += 56;
+    UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 200, 24)];
+    dl.text = @"delay ms"; dl.textColor = UIColor.whiteColor; [self.view addSubview:dl];
     self.dLab = [[UILabel alloc] initWithFrame:CGRectMake(W - 90, y, 74, 24)];
-    self.dLab.textAlignment = NSTextAlignmentRight; self.dLab.textColor = UIColor.lightGrayColor;
-    self.dLab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin; [self.view addSubview:self.dLab]; y += 26;
+    self.dLab.textAlignment = NSTextAlignmentRight;
+    self.dLab.textColor = UIColor.lightGrayColor;
+    self.dLab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.view addSubview:self.dLab]; y += 26;
     self.delay = [[UISlider alloc] initWithFrame:CGRectMake(16, y, W - 32, 30)];
-    self.delay.minimumValue = 100; self.delay.maximumValue = 2000;
-    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 100) dv = 200;
+    self.delay.minimumValue = 150; self.delay.maximumValue = 2000;
+    NSInteger dv = [UD() integerForKey:kDly]; if (dv < 150) dv = 250;
     self.delay.value = (float)dv;
     [self.delay addTarget:self action:@selector(onD:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.delay];
     self.dLab.text = [NSString stringWithFormat:@"%ld", (long)self.delay.value]; y += 40;
-
     self.stats = [[UILabel alloc] initWithFrame:CGRectMake(16, y, W - 32, 40)];
     self.stats.textColor = [UIColor colorWithRed:1 green:0.85 blue:0.2 alpha:1];
     self.stats.font = [UIFont boldSystemFontOfSize:15]; self.stats.numberOfLines = 2;
-    self.stats.text = [NSString stringWithFormat:@"累计¥%@ 成功%ld", Yuan(TotalFen()), (long)GrabCnt()];
+    self.stats.text = [NSString stringWithFormat:@"total Y%@ count %ld", Yuan(TotalFen()), (long)GrabCnt()];
     [self.view addSubview:self.stats]; y += 48;
-
     UIButton *rst = [UIButton buttonWithType:UIButtonTypeSystem];
     rst.frame = CGRectMake(16, y, 80, 30);
-    [rst setTitle:@"清空" forState:UIControlStateNormal];
+    [rst setTitle:@"reset" forState:UIControlStateNormal];
     [rst setTitleColor:[UIColor colorWithRed:1 green:0.4 blue:0.35 alpha:1] forState:UIControlStateNormal];
     [rst addTarget:self action:@selector(onRst) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:rst]; y += 40;
-
     UILabel *wl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 200, 22)];
-    wl.text = @"白名单不抢"; wl.textColor = UIColor.whiteColor; [self.view addSubview:wl]; y += 28;
+    wl.text = @"whitelist skip"; wl.textColor = UIColor.whiteColor; [self.view addSubview:wl]; y += 28;
     self.field = [[UITextField alloc] initWithFrame:CGRectMake(16, y, W - 100, 36)];
     self.field.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
     self.field.textColor = UIColor.whiteColor; self.field.layer.cornerRadius = 8;
-    self.field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0,0,8,36)];
+    self.field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 36)];
     self.field.leftViewMode = UITextFieldViewModeAlways; self.field.delegate = self;
-    self.field.autoresizingMask = UIViewAutoresizingFlexibleWidth; [self.view addSubview:self.field];
+    self.field.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:self.field];
     UIButton *add = [UIButton buttonWithType:UIButtonTypeSystem];
-    add.frame = CGRectMake(W - 76, y, 60, 36); add.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [add setTitle:@"添加" forState:UIControlStateNormal]; [add setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    add.backgroundColor = [UIColor colorWithRed:0.15 green:0.55 blue:0.25 alpha:1]; add.layer.cornerRadius = 8;
+    add.frame = CGRectMake(W - 76, y, 60, 36);
+    add.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [add setTitle:@"add" forState:UIControlStateNormal];
+    [add setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    add.backgroundColor = [UIColor colorWithRed:0.15 green:0.55 blue:0.25 alpha:1];
+    add.layer.cornerRadius = 8;
     [add addTarget:self action:@selector(onAdd) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:add]; y += 48;
-
     self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, y, W, MAX(80, self.view.bounds.size.height - y - 10)) style:UITableViewStylePlain];
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.table.backgroundColor = UIColor.clearColor; self.table.delegate = self; self.table.dataSource = self;
+    self.table.backgroundColor = UIColor.clearColor;
+    self.table.delegate = self; self.table.dataSource = self;
     [self.view addSubview:self.table];
 }
 - (void)onEn:(UISwitch *)s { [UD() setBool:s.on forKey:kEn]; [UD() synchronize]; RefreshBall(); }
-- (void)onD:(UISlider *)s { [UD() setInteger:(NSInteger)s.value forKey:kDly]; [UD() synchronize]; self.dLab.text=[NSString stringWithFormat:@"%ld",(long)s.value]; }
+- (void)onD:(UISlider *)s {
+    [UD() setInteger:(NSInteger)s.value forKey:kDly]; [UD() synchronize];
+    self.dLab.text = [NSString stringWithFormat:@"%ld", (long)s.value];
+}
 - (void)onRst {
-    [UD() setInteger:0 forKey:kFen]; [UD() setInteger:0 forKey:kCnt]; [UD() setObject:@[] forKey:kHis]; [UD() synchronize];
+    [UD() setInteger:0 forKey:kFen]; [UD() setInteger:0 forKey:kCnt];
+    [UD() setObject:@[] forKey:kHis]; [UD() synchronize];
     @synchronized (gLock) { [gAmtDone removeAllObjects]; }
-    self.stats.text = @"累计¥0.00 成功0"; RefreshBall();
+    self.stats.text = @"total Y0.00 count 0"; RefreshBall();
 }
 - (void)onAdd {
     NSString *t = [self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!t.length) return;
     if (![self.wl containsObject:t]) { [self.wl addObject:t]; SetWL(self.wl); [self.table reloadData]; }
-    self.field.text=@""; [self.field resignFirstResponder];
+    self.field.text = @""; [self.field resignFirstResponder];
 }
 - (void)close { gPanel.hidden = YES; gPanel = nil; }
 - (BOOL)textFieldShouldReturn:(UITextField *)t { [self onAdd]; return YES; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return self.wl.count; }
 - (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
-    UITableViewCell *c = [t dequeueReusableCellWithIdentifier:@"c"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
-    c.backgroundColor = UIColor.clearColor; c.textLabel.textColor = UIColor.whiteColor; c.textLabel.text = self.wl[ip.row];
+    UITableViewCell *c = [t dequeueReusableCellWithIdentifier:@"c"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
+    c.backgroundColor = UIColor.clearColor;
+    c.textLabel.textColor = UIColor.whiteColor;
+    c.textLabel.text = self.wl[ip.row];
     return c;
 }
 - (void)tableView:(UITableView *)t commitEditingStyle:(UITableViewCellEditingStyle)e forRowAtIndexPath:(NSIndexPath *)ip {
@@ -494,14 +424,13 @@ static NSString *CName(id w) {
     [self.wl removeObjectAtIndex:ip.row]; SetWL(self.wl);
     [t deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
 }
-- (NSString *)tableView:(UITableView *)t titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)ip { return @"删除"; }
 @end
 
 static void ShowPanel(void) {
     if (gPanel) { gPanel.hidden = NO; return; }
     CGRect sb = UIScreen.mainScreen.bounds;
-    CGFloat w = MIN(sb.size.width - 24, 360), h = MIN(sb.size.height * 0.68, 540);
-    gPanel = [[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width-w)/2,(sb.size.height-h)/2,w,h)];
+    CGFloat w = MIN(sb.size.width - 24, 360), h = MIN(sb.size.height * 0.68, 560);
+    gPanel = [[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width - w) / 2, (sb.size.height - h) / 2, w, h)];
     gPanel.windowLevel = UIWindowLevelAlert + 10;
     gPanel.layer.cornerRadius = 12; gPanel.clipsToBounds = YES;
     gPanel.rootViewController = [WWRGPanel new];
@@ -510,7 +439,7 @@ static void ShowPanel(void) {
 static void RefreshBall(void) {
     if (!gBall) return;
     BOOL on = On();
-    [gBall setTitle:on ? [NSString stringWithFormat:@"¥%@", Yuan(TotalFen())] : @"关" forState:UIControlStateNormal];
+    [gBall setTitle:(on ? [NSString stringWithFormat:@"Y%@", Yuan(TotalFen())] : @"OFF") forState:UIControlStateNormal];
     gBall.backgroundColor = on ? [UIColor colorWithRed:0.12 green:0.6 blue:0.28 alpha:0.94] : [UIColor colorWithWhite:0.35 alpha:0.9];
 }
 static void Drag(UIPanGestureRecognizer *pan) {
@@ -520,7 +449,7 @@ static void Drag(UIPanGestureRecognizer *pan) {
     [pan setTranslation:CGPointZero inView:v.superview];
     if (pan.state == UIGestureRecognizerStateEnded) {
         CGRect b = UIScreen.mainScreen.bounds;
-        CGFloat x = v.center.x < b.size.width/2 ? 28 : b.size.width - 28;
+        CGFloat x = v.center.x < b.size.width / 2 ? 28 : b.size.width - 28;
         CGFloat y = MIN(MAX(v.center.y, 70), b.size.height - 70);
         [UIView animateWithDuration:0.15 animations:^{ v.center = CGPointMake(x, y); }];
         [UD() setDouble:x forKey:kBX]; [UD() setDouble:y forKey:kBY]; [UD() synchronize];
@@ -547,33 +476,36 @@ static void EnsureUI(void) {
 #pragma clang diagnostic pop
         }
         if (!key) return;
-        CGFloat x=[UD() doubleForKey:kBX], y=[UD() doubleForKey:kBY];
+        CGFloat x = [UD() doubleForKey:kBX], y = [UD() doubleForKey:kBY];
         if (x < 10 || y < 10) { x = key.bounds.size.width - 28; y = key.bounds.size.height * 0.55; }
         gBall = [UIButton buttonWithType:UIButtonTypeCustom];
-        gBall.frame = CGRectMake(0,0,54,54); gBall.center = CGPointMake(x,y);
+        gBall.frame = CGRectMake(0, 0, 54, 54);
+        gBall.center = CGPointMake(x, y);
         gBall.layer.cornerRadius = 27; gBall.clipsToBounds = YES;
         gBall.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-        gBall.titleLabel.adjustsFontSizeToFitWidth = YES; gBall.titleLabel.numberOfLines = 2;
+        gBall.titleLabel.adjustsFontSizeToFitWidth = YES;
+        gBall.titleLabel.numberOfLines = 2;
         gBall.titleLabel.textAlignment = NSTextAlignmentCenter;
         [gBall setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        Class cls = NSClassFromString(@"WWRGBallP3");
+        Class cls = NSClassFromString(@"WWRGBallP4");
         if (!cls) {
-            cls = objc_allocateClassPair(NSObject.class, "WWRGBallP3", 0);
+            cls = objc_allocateClassPair(NSObject.class, "WWRGBallP4", 0);
             class_addMethod(cls, NSSelectorFromString(@"p:"), imp_implementationWithBlock(^(id s, UIPanGestureRecognizer *p){ Drag(p); }), "v@:@");
             class_addMethod(cls, NSSelectorFromString(@"t"), imp_implementationWithBlock(^(id s){
-                if (gPanel && !gPanel.hidden) { gPanel.hidden = YES; gPanel = nil; } else ShowPanel();
+                if (gPanel && !gPanel.hidden) { gPanel.hidden = YES; gPanel = nil; }
+                else ShowPanel();
             }), "v@:");
             objc_registerClassPair(cls);
         }
         static id px; if (!px) px = [cls new];
         [gBall addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:px action:NSSelectorFromString(@"p:")]];
         [gBall addTarget:px action:NSSelectorFromString(@"t") forControlEvents:UIControlEventTouchUpInside];
-        [key addSubview:gBall]; RefreshBall(); gUIReady = YES;
-        L(@"ball ready");
+        [key addSubview:gBall];
+        RefreshBall();
+        gUIReady = YES;
+        L(@"ball ready v4");
     });
 }
-
-#pragma mark - Install
 
 static void Install(void) {
     gLock = [NSObject new];
@@ -581,133 +513,46 @@ static void Install(void) {
     gPending = [NSMutableSet set];
     gAmtDone = [NSMutableSet set];
 
-    // receive
     Class wrap = NSClassFromString(@"WWKConversationWrapper");
     if (wrap) {
         SEL o = @selector(OnAddMessage:end:inConversation:);
         SEL n = NSSelectorFromString(@"wwrg_add:e:c:");
         Hook(wrap, o, n, ^(id self, const void *vec, BOOL end, void *cv) {
             ((void (*)(id, SEL, const void *, BOOL, void *))objc_msgSend)(self, n, vec, end, cv);
-            if (On() && end) OnVec(vec, CName(self));
-        });
-    }
-    Class list = NSClassFromString(@"WWKMessageListController");
-    if (list) {
-        SEL o = @selector(OnAddMessage:end:inConversation:);
-        SEL n = NSSelectorFromString(@"wwrg_ladd:e:c:");
-        Hook(list, o, n, ^(id self, const void *vec, BOOL end, void *cv) {
-            ((void (*)(id, SEL, const void *, BOOL, void *))objc_msgSend)(self, n, vec, end, cv);
-            // list path often noisy; still only end==YES
-            if (On() && end) OnVec(vec, @"");
+            if (On() && end) HandleVecSync(vec, CName(self));
         });
     }
 
-    Class mgr = NSClassFromString(@"WWRedEnvelopesMgr");
-    if (mgr) {
-        // open window: ALWAYS original. Auto only if armed.
-        SEL o1 = @selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:);
-        if (class_getInstanceMethod(mgr, o1)) {
-            SEL n = NSSelectorFromString(@"wwrg_ow1:v:tk:vt:c:m:");
-            Method om = class_getInstanceMethod(mgr, o1);
-            IMP imp = imp_implementationWithBlock(^(id self, const void *data, id vids, const void *tk, int vt, void *cv, void *msg) {
-                NSString *ticket = TicketFromPtr(tk);
-                BOOL armed = NO;
-                @synchronized (gLock) { armed = (gArmedHid.length > 0); }
-                L(@"openHB1 armed=%d ticket=%@", armed, ticket);
-                ((void (*)(id, SEL, const void *, id, const void *, int, void *, void *))objc_msgSend)(
-                    self, n, data, vids, tk, vt, cv, msg);
-                if (On() && armed) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        TryAutoOpenIfArmed();
-                    });
-                }
-            });
-            class_addMethod(mgr, n, imp, method_getTypeEncoding(om));
-            Swizzle(mgr, o1, n);
-        }
-        SEL o2 = @selector(openHongBaoWindow:toVidList:hbTicket:vidTicket:conv:msg:openBlock:cancelBlock:);
-        if (class_getInstanceMethod(mgr, o2)) {
-            SEL n = NSSelectorFromString(@"wwrg_ow2:v:tk:vt:c:m:ob:cb:");
-            Method om = class_getInstanceMethod(mgr, o2);
-            IMP imp = imp_implementationWithBlock(^(id self, const void *data, id vids, const void *tk, int vt, void *cv, void *msg, id ob, id cb) {
-                BOOL armed = NO;
-                @synchronized (gLock) { armed = (gArmedHid.length > 0); }
-                L(@"openHB2 armed=%d", armed);
-                ((void (*)(id, SEL, const void *, id, const void *, int, void *, void *, id, id))objc_msgSend)(
-                    self, n, data, vids, tk, vt, cv, msg, ob, cb);
-                if (On() && armed) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        TryAutoOpenIfArmed();
-                    });
-                }
-            });
-            class_addMethod(mgr, n, imp, method_getTypeEncoding(om));
-            Swizzle(mgr, o2, n);
-        }
-
-        // success: only close if armed recently / pending
-        if (class_getInstanceMethod(mgr, @selector(didOpenRedEvnSuc:))) {
-            SEL n = NSSelectorFromString(@"wwrg_ok:");
-            Hook(mgr, @selector(didOpenRedEvnSuc:), n, ^(id self, id arg) {
-                ((void (*)(id, SEL, id))objc_msgSend)(self, n, arg);
-                L(@"didOpenSuc %@", arg);
-            });
-        }
-    }
-
-    // amount bookkeeping only — do NOT force dismiss (manual must work)
     Class detail = NSClassFromString(@"WWRedEnvDetailViewController");
     if (detail && class_getInstanceMethod(detail, @selector(setMSelfRecvAmount:))) {
         SEL n = NSSelectorFromString(@"wwrg_amt:");
         Hook(detail, @selector(setMSelfRecvAmount:), n, ^(id self, unsigned long long fen) {
             ((void (*)(id, SEL, unsigned long long))objc_msgSend)(self, n, fen);
-            if (!On()) return;
+            if (!On() || fen == 0) return;
             id h = Call(self, @selector(mHongBaoID));
             NSString *hid = [h isKindOfClass:NSString.class] ? h : gLastHid;
-            L(@"金额 %llu 分 hid=%@", fen, hid);
-            Book(gLastConv, hid, (long long)fen, gLastWish);
-            // if this was our auto grab, dismiss detail quietly
             BOOL ours = NO;
             @synchronized (gLock) {
-                ours = (hid.length && [gDone containsObject:hid]) || (gLastHid.length && [hid isEqualToString:gLastHid]);
+                ours = (hid.length && ([gPending containsObject:hid] || [gDone containsObject:hid] || [gLastHid isEqualToString:hid]));
             }
-            if (ours) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    @try {
-                        UIViewController *vc = (UIViewController *)self;
-                        if (![vc isKindOfClass:UIViewController.class]) return;
-                        if (vc.presentingViewController) [vc dismissViewControllerAnimated:NO completion:nil];
-                        else if (vc.navigationController.topViewController == vc)
-                            [vc.navigationController popViewControllerAnimated:NO];
-                    } @catch (__unused NSException *e) {}
-                });
-            }
+            if (!ours) return;
+            L(@"amount %llu fen hid=%@", fen, hid);
+            Book(gLastConv, hid, (long long)fen, gLastWish);
         });
     }
 
-    // NO window didMoveToWindow/layout nukes — those break manual open
-
-    L(@"v3 safe installed on=%d delay=%ld", On(), (long)DelayMs());
+    L(@"v4 installed NO openHB hooks. on=%d delay=%ld", On(), (long)DelayMs());
 }
 
 __attribute__((constructor))
 static void Init(void) {
     @autoreleasepool {
         L(@"load %@", NSBundle.mainBundle.bundleIdentifier);
-        // default delay 200 if unset
-        if (![UD() objectForKey:kDly]) [UD() setInteger:200 forKey:kDly];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            Install();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            EnsureUI();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(9.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!gUIReady) EnsureUI();
-        });
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                        object:nil queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(__unused NSNotification *n) {
+        if (![UD() objectForKey:kDly]) [UD() setInteger:250 forKey:kDly];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ Install(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ EnsureUI(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ if (!gUIReady) EnsureUI(); });
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
             if (!gUIReady) EnsureUI();
             else if (gBall && !gBall.superview) { gUIReady = NO; EnsureUI(); }
         }];
