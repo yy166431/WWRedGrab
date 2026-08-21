@@ -114,7 +114,7 @@ static long long WWRGParseYuanToFen(NSString *s) {
     for (NSUInteger i = 0; i < s.length; i++) {
         unichar c = [s characterAtIndex:i];
         if (c >= '0' && c <= '9') [m appendFormat:@"%C", c];
-        else if ((c == '.' || c == '。') && !dot) { [m appendString:@"."]; dot = YES; }
+        else if ((c == '.' || c == 0x3002) && !dot) { [m appendString:@"."]; dot = YES; }
     }
     if (!m.length) return 0;
     return (long long)llround([m doubleValue] * 100.0);
