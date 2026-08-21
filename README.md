@@ -1,69 +1,38 @@
 # WWRedGrab
 
-企业微信 (WeCom) 秒抢红包 dylib — 巨魔 / TrollFools 注入
+企业微信秒抢红包 dylib（协议直拆 / 巨魔 TrollFools）
 
-## Target
+## 目标
 
-- App: 企业微信 `com.tencent.ww`
-- Tested binary: 5.0.10 (build 229043)
-- iOS 15+
-- arm64
+- `com.tencent.ww` 企业微信 5.0.10+
+- iOS 15+ arm64
 
-## Features
+## 原理（跟安卓拼手速）
 
-- Auto grab red packets on receive / in-chat bubble
-- Floating ball: drag + tap open panel
-- Master switch
-- Delay 0~3000ms
-- Whitelist (conversation name contains → **skip**)
-- Total amount + grab count + history
-- Reset stats
+不走点开 UI，走官方同一条网络链：
 
-## Build
+1. `OnAddMessage` 发现红包消息  
+2. `tony_onClickHongbaoMessage` → 内部 **SendGrabHongBao**  
+3. 截获 `openHongBaoWindow:...openBlock:` → **直接回调 openBlock**  
+   - openBlock 内部就是 **SendUnWrapHongBao**（协议拆包）  
+   - **不创建开包窗 / 详情页**  
+4. 金额：`mSelfRecvAmount` / `didOpenRedEvnSuc` / header amount / RecvInfo 通知
 
-GitHub Actions (macos + Xcode):
+延迟建议 **0ms**。白名单 = 会话名包含则**不抢**。
 
-```
-push main → artifact WWRedGrab-dylib
-```
+## 功能
 
-Local (macOS):
+- 协议直拆（无弹窗）
+- 悬浮球：开关 / 延迟 / 白名单 / 累计金额 / 记录
+- 中文面板
 
-```bash
-make
-```
+## 构建
 
-## Install (TrollStore / TrollFools)
+GitHub Actions → artifact `WWRedGrab-dylib`  
+或 macOS: `make`
 
-1. Actions → latest run → download `WWRedGrab-dylib`
-2. TrollFools → 企业微信 → inject `WWRedGrab.dylib`
-3. 强杀企业微信重开，等悬浮球出现
+## 注入
 
-## Hook map (5.0.10)
+TrollFools → 企业微信 → 注入 `WWRedGrab.dylib` → 强杀重开
 
-| Class | Selector | Role |
-|-------|----------|------|
-| `WWKConversationWrapper` | `OnAddMessage:end:inConversation:` | new msg push |
-| `WWKMessageListController` | same | list path |
-| `WWKConversationRedEnvelopesBubbleView` | `updateData` / `tony_onClickHongbaoMessage` | in-chat + click |
-| `WWRedEnvOpenHongBaoWindow` | `_updateUIData` / `onOpenBtnClick:` | auto open |
-| `WWRedEnvOpenResultWindow` | `_updateUIData:` | amount |
-| `WWRedEnvelopesMgr` | `didOpenRedEvnSuc:` / `openHongBaoWindow:...` | success + window |
-| `WWKMessage` | `p_parseHongBaoMessage:` | parse path |
-
-## Notes
-
-- Whitelist = **do not grab** those conversations
-- Amount unit follows client `mTotalAmount` (fen)
-- If WeCom upgrades breaks hooks, re-dump ObjC and patch selectors
-- Logs: `NSLog` tag `[WWRedGrab]`
-
-## Layout
-
-```
-WWRedGrab/
-├── WWRedGrab.m
-├── Makefile
-├── .github/workflows/build.yml
-└── README.md
-```
+日志：`[WWRedGrab]`
