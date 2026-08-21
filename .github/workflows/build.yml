@@ -1,0 +1,48 @@
+name: Build WWRedGrab Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Check environment
+      run: |
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-path
+        clang --version
+
+    - name: Install ldid
+      run: brew install ldid || true
+
+    - name: Build dylib
+      run: make
+
+    - name: Verify build
+      run: |
+        ls -lh WWRedGrab.dylib
+        file WWRedGrab.dylib
+        otool -L WWRedGrab.dylib
+        otool -l WWRedGrab.dylib | grep -A2 "LC_BUILD_VERSION\|LC_VERSION_MIN" | head -20
+        lipo -info WWRedGrab.dylib || true
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WWRedGrab-dylib
+        path: WWRedGrab.dylib
+        retention-days: 30
